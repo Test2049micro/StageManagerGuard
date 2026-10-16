@@ -361,6 +361,25 @@ def main() -> int:
     # 请求堆积必须被拦住
     check("_pending_request" in src, "guard 必须检测未消费请求，避免请求无限堆积")
 
+    # 9) AX 权限拒绝必须可自诊：新人没授辅助功能权限时只看到 osascript 天书报错
+    #    （-1743），不知道去哪开权限——公开仓库后的第一个上手坑
+    sd = importlib.import_module("sm_daemon")
+    hint = sd.ax_deny_hint("execution error: Not authorized to send Apple events. (-1743)")
+    check(hint is not None and "辅助功能" in hint and "隐私与安全" in hint,
+          "AX 拒绝报错必须翻译成含系统设置路径的可操作指引")
+    check(sd.ax_deny_hint(
+        "execution error: System Events got an error: AppleEvent timed out. (-1712)") is None,
+          "-1712 超时不得误报为权限拒绝（AX 惰性/会话问题，修法不同）")
+    check(sd.ax_deny_hint("osascript is not allowed assistive access") is not None,
+          "assistive access 变体也必须识别")
+    check(sd.ax_deny_hint("") is None and sd.ax_deny_hint("kCGErrorFailure") is None,
+          "空报错与无关报错不得触发指引（防误报）")
+    check(all(s == s.lower() for s in sd.AX_DENY_SIGNATURES),
+          "AX_DENY_SIGNATURES 必须全小写（匹配按 lower 后比对）")
+    # 翻译器必须真接在 osa() 出错路径上（防"只定义不调用"的真空实现）
+    check("ax_deny_hint(" in dsrc and "_AX_HINTED[0] = True" in dsrc,
+          "osa() 出错路径必须实际调用 ax_deny_hint() 且带一次性去重")
+
     failed = [m for ok, m in results if not ok]
     for ok, m in results:
         print(("PASS  " if ok else "FAIL  ") + m)

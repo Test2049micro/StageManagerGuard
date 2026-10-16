@@ -137,6 +137,33 @@ def log(msg: str) -> None:
         pass
 
 
+# osascript stderr 里的 AX 权限拒绝签名（小写比对）。注意与 -1712 超时区分：
+# 超时多数是 AX 惰性或非用户会话启动，权限拒绝是另一回事，混在一起会误导排查。
+AX_DENY_SIGNATURES = (
+    "assistive access",
+    "not authorized to send apple events",
+    "not allowed to send apple events",
+)
+
+
+def ax_deny_hint(err: str):
+    """识别辅助功能权限拒绝并把 osascript 天书报错翻译成可操作指引。
+
+    新人第一个坑：没授 AX 权限时只会看到 "Not authorized to send Apple
+    events (-1743)"，不知道要去系统设置开权限。非权限错误返回 None 不打扰。
+    """
+    low = (err or "").lower()
+    for sig in AX_DENY_SIGNATURES:
+        if sig in low:
+            return ("辅助功能（AX）权限被拒：打开 系统设置 → 隐私与安全性 → 辅助功能，"
+                    "给运行本守护进程的程序（终端/iTerm 等）打开开关后重试。"
+                    f"原始报错: {err[:200]}")
+    return None
+
+
+_AX_HINTED = [False]    # 权限提示每次进程生命周期只报一次，避免重试时刷屏
+
+
 def osa(script: str, timeout: int = 30):
     """执行 AppleScript。
 
@@ -153,6 +180,11 @@ def osa(script: str, timeout: int = 30):
             f.write(script)
         r = subprocess.run(["osascript", tmp],
                            capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0 and not _AX_HINTED[0]:
+            hint = ax_deny_hint(r.stderr or "")
+            if hint:
+                _AX_HINTED[0] = True
+                log(hint)
         return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
     except Exception as e:
         return -1, "", str(e)
