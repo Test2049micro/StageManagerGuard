@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.stage-manager-guard</string>
+
+    <!--
+      双触发：
+        1) StartInterval 3s —— 主路径。NSScreen 计数极轻，3 秒足以让插拔显示器
+           在用户察觉前完成切换。
+        2) WatchPaths —— 加分项。DisplayLink 外接屏走网络接口，
+           NetworkInterfaces.plist 变化即唤醒一次；窗口偏好文件变化也触发。
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <!-- -u 必须带：Python 在非 TTY 下默认全缓冲，launchd 的 stdout 重定向会丢日志 -->
+        <string>@PYTHON@</string>
+        <string>-u</string>
+        <string>@BINDIR@/src/stage_manager_guard.py</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>3</integer>
+
+    <key>WatchPaths</key>
+    <array>
+        <string>/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist</string>
+        <string>/Users/@USER@/Library/Preferences/com.apple.WindowManager.plist</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- ⚠️ 不要加 ProcessType=Background：实测该值会让任务挂死在 xpcproxy 阶段、
+         日志全空、进程永不退出（同配置去掉即恢复）。 -->
+
+    <key>StandardOutPath</key>
+    <string>@SMG_HOME@/guard.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>@SMG_HOME@/guard.launchd.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>SMG_HOME</key>
+        <string>@SMG_HOME@</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,20 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build DisplayProbe
+        run: ./build.sh
+      - name: Probe smoke test
+        run: |
+          ./bin/DisplayProbe screens
+          ./bin/DisplayProbe pref
+      - name: Regression tests
+        # CI 无 GUI 会话：测试全部走桩与静态断言，不碰真实开关
+        run: python3 -u tests/test_stage_manager_guard.py
