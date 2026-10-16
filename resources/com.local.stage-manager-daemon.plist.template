@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.stage-manager-daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- -u 必须带：Python 在非 TTY 下默认全缓冲，launchd 的 stdout 重定向会丢日志 -->
+        <string>@PYTHON@</string>
+        <string>-u</string>
+        <string>@BINDIR@/src/sm_daemon.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- 必须限定 Aqua 会话：LaunchAgent 落在非图形会话时拿不到辅助功能（AX）权限，
+         System Events 一律 AppleEvent timed out，点不了开关。 -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <!-- ⚠️ 不要加 ProcessType=Background：实测会让任务挂死在 xpcproxy 阶段。 -->
+
+    <key>StandardOutPath</key>
+    <string>@SMG_HOME@/daemon.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>@SMG_HOME@/daemon.launchd.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>SMG_HOME</key>
+        <string>@SMG_HOME@</string>
+    </dict>
+</dict>
+</plist>
