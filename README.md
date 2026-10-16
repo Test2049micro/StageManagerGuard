@@ -2,6 +2,8 @@
 
 [简体中文](README.md) | [English](README.en.md)
 
+![CI](https://github.com/Test2049micro/StageManagerGuard/actions/workflows/test.yml/badge.svg)
+
 **多显示器时自动关闭 macOS 台前调度（Stage Manager），拔掉外接屏后自动恢复原状。**
 
 ![Architecture: guard polls displays and writes request.json, daemon clicks the Stage Manager toggle in System Settings and reports back via result.json](assets/architecture.svg)
