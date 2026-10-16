@@ -148,10 +148,26 @@ def pref_enabled() -> bool | None:
 # ---------- 状态文件 ----------
 
 def load_state() -> dict:
+    """读状态文件。解析失败时保留现场并返回 {}（不静默吞掉损坏文件）。
+
+    为什么不能静默 return {}：状态文件是"该恢复成什么"的唯一依据。
+    若它因掉电/半截写入损坏，静默当空会导致两类错误决策——
+    单屏时判成"本工具没关过"而漏恢复；多屏时判成"用户自己关的"而覆盖
+    记下的 pref_before_close。把坏文件改名留档，至少事后可追。
+    """
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        try:
+            kept = f"{STATE_PATH}.corrupt-{int(time.time())}"
+            os.replace(STATE_PATH, kept)
+            log(f"state file corrupt ({e}); kept original at {kept}, starting fresh")
+        except OSError:
+            log(f"state file corrupt ({e}); and could not preserve it")
         return {}
 
 
