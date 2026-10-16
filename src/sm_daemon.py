@@ -86,12 +86,23 @@ end tell
 """
 
 
+LOG_MAX_BYTES = 2_000_000   # 代码自持日志的轮转阈值（macOS 无 logrotate）
+
+
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     try:
         os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        # 轮转：超限滚到 .1。只管代码自己 open 的这份；
+        # launchd 重定向的 daemon.launchd.log 由 launchd 持有 fd，rename 无效，
+        # 故 plist 模板把 launchd 的 stdout/stderr 指向 /dev/null（见 resources/）。
+        try:
+            if os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+                os.replace(LOG_PATH, LOG_PATH + ".1")
+        except OSError:
+            pass
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError:

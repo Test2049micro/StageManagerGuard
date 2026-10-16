@@ -25,10 +25,12 @@
 
     <!-- ⚠️ 不要加 ProcessType=Background：实测会让任务挂死在 xpcproxy 阶段。 -->
 
+    <!-- launchd 持有 stdout 文件的 fd，代码轮转（rename）对它无效，只会无限增长。
+         daemon 自己写带轮转的 daemon.log，launchd 这一路直接丢弃。 -->
     <key>StandardOutPath</key>
-    <string>@SMG_HOME@/daemon.launchd.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>@SMG_HOME@/daemon.launchd.log</string>
+    <string>/dev/null</string>
 
     <key>EnvironmentVariables</key>
     <dict>

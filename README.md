@@ -75,6 +75,31 @@ cd stage-manager-guard
   （失败方向安全：不会把用户没开的功能打开）。
 - 多屏判定以 `NSScreen` 实际在役数为准；镜像模式下两屏计为两屏。
 
+## 如何确认它在正常工作
+
+```bash
+# 1) 两个任务都在
+launchctl print gui/$(id -u)/com.local.stage-manager-guard | grep -E 'state|last exit'
+launchctl print gui/$(id -u)/com.local.stage-manager-daemon | grep -E 'state'
+
+# 2) 探测与决策正常
+python3 src/stage_manager_guard.py --probe
+# 输出如 {"screens": 2, "pref_enabled": true, "closed_by_script": false}
+
+# 3) 日志（代码自写、自动轮转，上限约 2MB×2）
+#    ~/Library/Application Support/StageManagerGuard/guard.log
+#    ~/Library/Application Support/StageManagerGuard/daemon.log
+```
+
+常见故障：
+
+| 症状 | 原因 | 处置 |
+|---|---|---|
+| daemon.log 反复 `AppleEvent timed out` | 未给辅助功能权限 | 系统设置 › 隐私与安全性 › 辅助功能，勾选 install.sh 打印的 python3 |
+| daemon.log 反复 `cannot open settings pane` | AX 树间歇性惰性 | 会自动重试；若持续数小时，重启 daemon：`launchctl kickstart -k gui/$(id -u)/com.local.stage-manager-daemon` |
+| 崩溃但 launchd 日志为空 | plist 的 stdout 指向 /dev/null | 崩溃 traceback 会写进 guard.log（`FATAL:` 开头） |
+| 显示器变了但没动作 | guard 探测失败会拒绝猜测 | 看 guard.log 是否有 `ABORT`；确认 `./bin/DisplayProbe screens` 能跑通 |
+
 ## 开发
 
 ```bash
