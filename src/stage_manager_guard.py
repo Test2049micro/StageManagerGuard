@@ -85,6 +85,9 @@ signal.signal(signal.SIGALRM, _alarm_handler)
 
 # ---------- 基础工具 ----------
 
+LOG_MAX_BYTES = 2_000_000   # 代码自持日志的轮转阈值（macOS 无 logrotate）
+
+
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -92,6 +95,14 @@ def log(msg: str) -> None:
     print(line, flush=True)
     try:
         os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        # 轮转：超限滚到 .1（覆盖旧的），封顶约 2×LOG_MAX_BYTES。
+        # 只管代码自己 open 的这份；launchd 重定向的 guard.launchd.log 由 launchd 持有
+        # fd，rename 后它仍写旧 inode，无法在此轮转（见 README 排障节）。
+        try:
+            if os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+                os.replace(LOG_PATH, LOG_PATH + ".1")
+        except OSError:
+            pass
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError:
@@ -431,4 +442,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        # launchd 的 stderr 指向 /dev/null（见 plist 模板），未捕获的崩溃
+        # 若不写进轮转日志就彻底丢失。这里兜底记录 traceback。
+        import traceback
+        log("FATAL: uncaught exception:\n" + traceback.format_exc())
+        sys.exit(4)

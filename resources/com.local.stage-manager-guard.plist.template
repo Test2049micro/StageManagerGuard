@@ -35,10 +35,13 @@
     <!-- ⚠️ 不要加 ProcessType=Background：实测该值会让任务挂死在 xpcproxy 阶段、
          日志全空、进程永不退出（同配置去掉即恢复）。 -->
 
+    <!-- launchd 持有 stdout 文件的 fd，代码轮转（rename）对它无效，只会无限增长。
+         两个脚本都自己写带轮转的日志（guard.log / daemon.log），
+         所以 launchd 这一路直接丢弃。 -->
     <key>StandardOutPath</key>
-    <string>@SMG_HOME@/guard.launchd.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>@SMG_HOME@/guard.launchd.log</string>
+    <string>/dev/null</string>
 
     <key>EnvironmentVariables</key>
     <dict>
