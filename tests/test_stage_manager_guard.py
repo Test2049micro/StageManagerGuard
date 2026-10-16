@@ -307,6 +307,33 @@ def main() -> int:
               f"{name} 不得用 subprocess.Popen（会留孤儿；须用 subprocess.run）")
         check("subprocess.run" in f, f"{name} 必须用 subprocess.run 起子进程")
 
+    # 8n) 首装友好性：未 build 时必须给可诊断提示（不是裸 Errno 2），
+    #     且 --probe 探测失败要返回非零（否则 CI/脚本无法判定）
+    check("run ./build.sh first" in src,
+          "探测工具缺失时必须提示 build.sh（新用户看不懂裸 Errno 2）")
+    check("_WARNED_NO_PROBE" in src, "缺失提示必须去重（两处调用否则刷屏）")
+    check("else 3" in src or "return 0 if (n is not None and pf is not None) else 3" in src,
+          "--probe 探测失败必须返回非零退出码")
+
+    # 8o) plist 模板：占位符必须被 install.sh 全部替换（隔离渲染验证其可渲染性）
+    import subprocess as _sp
+    tpl_dir = HERE.parent / "resources"
+    for label in ("com.local.stage-manager-guard", "com.local.stage-manager-daemon"):
+        tpl = tpl_dir / f"{label}.plist.template"
+        check(tpl.exists(), f"{label}.plist.template 必须存在")
+        if tpl.exists():
+            with tempfile.TemporaryDirectory() as td:
+                out = pathlib.Path(td) / "r.plist"
+                txt = tpl.read_text(encoding="utf-8")
+                for ph, val in (("@BINDIR@", "/opt/x"), ("@PYTHON@", "/usr/bin/python3"),
+                                ("@SMG_HOME@", "/tmp/smg"), ("@USER@", "tester")):
+                    txt = txt.replace(ph, val)
+                out.write_text(txt, encoding="utf-8")
+                r = _sp.run(["plutil", "-lint", str(out)], capture_output=True, text=True)
+                check(r.returncode == 0, f"{label} 渲染后必须 plutil lint 通过")
+                check("@BINDIR@" not in txt and "@SMG_HOME@" not in txt,
+                      f"{label} 不得残留占位符")
+
     # 8l) daemon 的 ALREADY 分支也必须更新空闲计时：否则反复处理"已是目标态"
     #     的请求时计时停在旧值，窗口被误关、下次又要 18–28 秒冷启动
     already_seg = dsrc.split('if state == "ALREADY"')[1].split("# CLICKED")[0]

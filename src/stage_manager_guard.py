@@ -69,6 +69,7 @@ REQUEST_STALE_AFTER = 180              # inflight 请求超过此时长未完成
 # 单轮总时限（秒）。launchd 每 3 秒唤起一次，任何子进程卡住（实测出现过
 # subprocess.run 的 wait 永久阻塞、子进程已消失但父进程等不到——__semwait_signal）
 # 都会让轮询停摆数小时。用 alarm 强制收尾，宁可本轮不做事也不能卡死。
+_WARNED_NO_PROBE = False   # 未 build 的提示只打一次
 ROUND_BUDGET = 150   # 必须 > REQUEST_TIMEOUT + 探测余量，否则 alarm 会砍断正常的结果等待
 
 
@@ -115,6 +116,15 @@ def run_probe(sub: str) -> dict:
     NSScreen 首次访问要连 WindowServer，在 launchd 环境下偶发极慢（实测出现过 >20s），
     故超时放宽并重试一次：单次超时是瞬态，不能当成"读不到"而中止整轮。
     """
+    # 先给出可诊断的提示：未 build 时裸 Errno 2 对新用户毫无指向性。
+    # 只警告一次（screen_count 与 pref_enabled 各会调一次 run_probe，否则重复刷屏）。
+    global _WARNED_NO_PROBE
+    if not os.path.exists(PROBE):
+        if not _WARNED_NO_PROBE:
+            _WARNED_NO_PROBE = True
+            log(f"probe binary missing at {PROBE} — run ./build.sh first "
+                f"(swiftc is bundled with macOS Command Line Tools)")
+        return {}
     last_err = ""
     for attempt in range(1, PROBE_ATTEMPTS + 1):
         try:
@@ -452,7 +462,8 @@ def main() -> int:
             "pref_enabled": pf,
             "closed_by_script": bool(st.get("closed_by_script")),
         }, ensure_ascii=False))
-        return 0
+        # 探测失败要能被脚本/CI 识别：null 值 + exit 非零
+        return 0 if (n is not None and pf is not None) else 3
 
     return run(dry_run=args.dry_run)
 
