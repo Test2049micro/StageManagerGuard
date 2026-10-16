@@ -43,8 +43,22 @@ LOCK_PATH = os.path.join(DIR, "daemon.lock")
 LOG_PATH = os.path.join(DIR, "daemon.log")
 
 SETTINGS_PANE_URL = "x-apple.systempreferences:com.apple.Desktop-Settings.extension"
-SETTINGS_WINDOW = "Desktop & Dock"
-TOGGLE_NAME = "Stage Manager"
+# 无障碍名/窗口标题随系统语言本地化，单字符串精确匹配在非英文系统会静默失效。
+# 英文值本机实测；中文值取自 Apple 官方本地化表（一手证据，勿凭记忆改）：
+#   /System/Library/ExtensionKit/Extensions/DesktopSettings.appex/Contents/Resources/Localizable.loctable
+#   "Stage Manager" -> zh_CN "台前调度" / zh_TW "幕前調度" / zh_HK "幕前管理"
+#   "Desktop & Dock" -> zh_CN "桌面与程序坞" / zh_TW|zh_HK "桌面與Dock"
+# 中文候选未经中文系统实测；匹配不到时 fail-safe（读不到即不动 GUI）。
+WINDOW_CANDIDATES = ["Desktop & Dock", "桌面与程序坞", "桌面與Dock"]
+TOGGLE_CANDIDATES = ["Stage Manager", "台前调度", "幕前調度", "幕前管理"]
+# 兼容旧代码里对这两个名字的引用
+SETTINGS_WINDOW = WINDOW_CANDIDATES[0]
+TOGGLE_NAME = TOGGLE_CANDIDATES[0]
+
+
+def _as_list(items: list) -> str:
+    """转成 AppleScript 列表字面量，如 {"a", "b"}。"""
+    return "{" + ", ".join('"%s"' % i for i in items) + "}"
 
 POLL_INTERVAL = 1.0
 RETRY_LIMIT = 5
@@ -56,32 +70,46 @@ PANE_READY_TRIES = 20
 CLICK_SETTLE = 1.5
 _OSA_TMP_N = 0                # osascript 临时文件序号（保证文件名唯一）
 
+# 窗口名与开关名都按候选集合匹配（系统语言不同则不同），
+# 在 AppleScript 内遍历窗口，避免 Python 侧写死某个语言的标题。
 _READ_UI = """\
-tell application "System Events" to tell process "System Settings"
-    set allUI to entire contents of window "{win}"
-    repeat with u in allUI
-        try
-            if (class of u as string) is "checkbox" and (name of u as string) is "{name}" then
-                return (value of u as string)
-            end if
-        end try
-    end repeat
-    return "NOT_FOUND"
+tell application "System Events"
+    tell process "System Settings"
+        repeat with w in windows
+            try
+                set allUI to entire contents of w
+                repeat with u in allUI
+                    try
+                        if (class of u as string) is "checkbox" and {names} contains (name of u as string) then
+                            return (value of u as string)
+                        end if
+                    end try
+                end repeat
+            end try
+        end repeat
+        return "NOT_FOUND"
+    end tell
 end tell
 """
 
 _CLICK_UI = """\
-tell application "System Events" to tell process "System Settings"
-    set allUI to entire contents of window "{win}"
-    repeat with u in allUI
-        try
-            if (class of u as string) is "checkbox" and (name of u as string) is "{name}" then
-                click u
-                return "CLICKED"
-            end if
-        end try
-    end repeat
-    return "NOT_FOUND"
+tell application "System Events"
+    tell process "System Settings"
+        repeat with w in windows
+            try
+                set allUI to entire contents of w
+                repeat with u in allUI
+                    try
+                        if (class of u as string) is "checkbox" and {names} contains (name of u as string) then
+                            click u
+                            return "CLICKED"
+                        end if
+                    end try
+                end repeat
+            end try
+        end repeat
+        return "NOT_FOUND"
+    end tell
 end tell
 """
 
@@ -186,12 +214,12 @@ def sentinel_shot() -> None:
 
 
 def read_ui() -> str:
-    rc, out, _ = osa(_READ_UI.format(win=SETTINGS_WINDOW, name=TOGGLE_NAME))
+    rc, out, _ = osa(_READ_UI.format(names=_as_list(TOGGLE_CANDIDATES)))
     return out if out in ("0", "1") else "NOT_FOUND"
 
 
 def click_ui() -> str:
-    rc, out, _ = osa(_CLICK_UI.format(win=SETTINGS_WINDOW, name=TOGGLE_NAME))
+    rc, out, _ = osa(_CLICK_UI.format(names=_as_list(TOGGLE_CANDIDATES)))
     return out if out in ("CLICKED", "NOT_FOUND") else f"ERR:{rc}:{out}"
 
 
@@ -208,19 +236,23 @@ def click_ui() -> str:
 _TOGGLE_ONE_SHOT = """\
 tell application "System Events"
     tell process "System Settings"
-        set allUI to entire contents of window "{win}"
-        repeat with u in allUI
+        repeat with w in windows
             try
-                if (class of u as string) is "checkbox" and (name of u as string) is "{name}" then
-                    set cur to (value of u as string)
-                    if cur is "{want}" then
-                        return "ALREADY|" & cur
-                    end if
-                    click u
-                    delay {settle}
-                    set newval to (value of u as string)
-                    return "CLICKED|" & cur & "|" & newval
-                end if
+                set allUI to entire contents of w
+                repeat with u in allUI
+                    try
+                        if (class of u as string) is "checkbox" and {names} contains (name of u as string) then
+                            set cur to (value of u as string)
+                            if cur is "{want}" then
+                                return "ALREADY|" & cur
+                            end if
+                            click u
+                            delay {settle}
+                            set newval to (value of u as string)
+                            return "CLICKED|" & cur & "|" & newval
+                        end if
+                    end try
+                end repeat
             end try
         end repeat
         return "NOT_FOUND"
@@ -232,7 +264,7 @@ end tell
 def toggle_one_shot(want: str, settle: float) -> tuple[str, str]:
     """一次 osascript 内完成读/点/读回。返回 (状态, 详情)。"""
     rc, out, err = osa(_TOGGLE_ONE_SHOT.format(
-        win=SETTINGS_WINDOW, name=TOGGLE_NAME, want=want, settle=settle), timeout=40)
+        names=_as_list(TOGGLE_CANDIDATES), want=want, settle=settle), timeout=40)
     if out.startswith(("ALREADY|", "CLICKED|")):
         return out.split("|")[0], out
     return "NOT_FOUND", f"rc={rc} err={err[:120]}"

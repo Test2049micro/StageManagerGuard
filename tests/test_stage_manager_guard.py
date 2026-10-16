@@ -165,8 +165,22 @@ def main() -> int:
     check(daemon.exists(), "stage-manager/sm_daemon.py 必须存在（执行端）")
     if daemon.exists():
         dsrc = daemon.read_text(encoding="utf-8")
-        check("TOGGLE_NAME" in dsrc and "Stage Manager" in dsrc,
-              "daemon 必须保留开关无障碍名称常量")
+        check("Stage Manager" in dsrc, "daemon 必须保留开关无障碍名称（英文）")
+        # 本地化：无障碍名与窗口标题随系统语言变化，单字符串精确匹配会在
+        # 非英文系统静默失效。必须用候选集合匹配，且中文值要有官方来源
+        # （loctable 一手证据，见源码注释）。
+        check("TOGGLE_CANDIDATES" in dsrc and "WINDOW_CANDIDATES" in dsrc,
+              "daemon 必须用候选名集合匹配（防非英文系统静默失效）")
+        for zh in ("台前调度", "幕前調度", "幕前管理"):
+            check(zh in dsrc, f"开关候选必须含中文译名 {zh}")
+        check("桌面与程序坞" in dsrc, "窗口候选必须含 zh_CN 面板名")
+        check('contains (name of u as string)' in dsrc,
+              "AppleScript 必须用 contains 做候选包含判断，而非 is 精确等于")
+        # 不得残留按单一写死名取窗口的写法（那会在非英文系统找不到窗口）
+        check('entire contents of window "{win}"' not in dsrc,
+              "不得再用写死窗口名取 UI 树（须遍历 windows 匹配候选）")
+        check("repeat with w in windows" in dsrc,
+              "必须遍历 windows 按候选名匹配窗口")
         check("click u" in dsrc, "daemon 必须真的执行点击（执行端不能退化成只读）")
         check("pref_enabled" in dsrc, "daemon 必须读回 pref 做双重确认")
         check("result.json" in dsrc, "daemon 必须写回 result.json 供 guard 判成败")
