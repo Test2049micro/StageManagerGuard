@@ -1,0 +1,77 @@
+name: Bug report / 问题报告
+description: Report a problem with StageManagerGuard / 报告 StageManagerGuard 的问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying StageManagerGuard! The logs below are the fastest path to a diagnosis.
+        感谢试用！下面几项日志是定位问题最快的材料。
+
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version / 系统版本
+      description: Output of `sw_vers --productVersion`
+      placeholder: e.g. 15.1 / 27.0
+    validations:
+      required: true
+
+  - type: input
+    id: system-language
+    attributes:
+      label: System language / 系统语言
+      description: >
+        The Settings toggle title is localized; matching uses a candidate list
+        (currently English + 简中/繁中). / 开关标题随语言本地化，当前内置英/中候选名。
+      placeholder: e.g. English / 简体中文
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened? / 发生了什么
+      description: >
+        Which display change triggered it (plugged in / unplugged / mirrored?),
+        what you expected, and what actually happened.
+        什么显示器变化触发的（插上/拔掉/镜像？），预期是什么，实际发生了什么。
+    validations:
+      required: true
+
+  - type: textarea
+    id: probe
+    attributes:
+      label: Probe output / 探测输出
+      description: "`python3 src/stage_manager_guard.py --probe`"
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / 日志
+      description: |
+        Paste the tail of both logs / 请粘贴两个日志的末尾：
+        ```shell
+        tail -50 ~/Library/Application\ Support/StageManagerGuard/guard.log
+        tail -50 ~/Library/Application\ Support/StageManagerGuard/daemon.log
+        ```
+      render: shell
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: accessibility-granted
+    attributes:
+      label: Accessibility granted? / 已授权辅助功能？
+      description: >
+        System Settings › Privacy & Security › Accessibility has the python3 path
+        printed by install.sh enabled. / 系统设置 › 隐私与安全性 › 辅助功能 里
+        install.sh 结束时打印的那个 python3 已勾选。
+      options:
+        - label: "Yes / 已授权"
+        - label: "Not sure / 不确定"
+    validations:
+      required: true

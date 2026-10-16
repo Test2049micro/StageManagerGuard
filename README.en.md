@@ -2,6 +2,8 @@
 
 [English](README.en.md) | [简体中文](README.md)
 
+![CI](https://github.com/Test2049micro/StageManagerGuard/actions/workflows/test.yml/badge.svg)
+
 **Automatically turns off macOS Stage Manager when an external display is connected, and restores your original setting once you're back to a single display.**
 
 ![Architecture: guard polls displays and writes request.json, daemon clicks the Stage Manager toggle in System Settings and reports back via result.json](assets/architecture.svg)
