@@ -74,6 +74,10 @@ cd stage-manager-guard
 - 若 Apple 未来重命名该开关或移动面板，读回校验会失败并**保持原状不乱动**
   （失败方向安全：不会把用户没开的功能打开）。
 - 多屏判定以 `NSScreen` 实际在役数为准；镜像模式下两屏计为两屏。
+- **非英文系统**：系统设置里的开关名与面板标题随语言本地化（如简体中文「台前调度」
+  「桌面与程序坞」）。已内置中/英候选名匹配（中文值取自 Apple 官方 loctable），
+  但**中文系统未经实机验证**；其它语言需自行往 `TOGGLE_CANDIDATES` / `WINDOW_CANDIDATES`
+  补译名（可直接从 `DesktopSettings.appex/Contents/Resources/Localizable.loctable` 取）。
 
 ## 如何确认它在正常工作
 
