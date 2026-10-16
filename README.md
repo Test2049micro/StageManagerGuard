@@ -2,6 +2,8 @@
 
 **多显示器时自动关闭 macOS 台前调度（Stage Manager），拔掉外接屏后自动恢复原状。**
 
+![Architecture: guard polls displays and writes request.json, daemon clicks the Stage Manager toggle in System Settings and reports back via result.json](assets/architecture.svg)
+
 它是唯一「记得你原本设置」的 Stage Manager 开关：多屏自动关，单屏恢复成
 **你关掉之前的状态**——包括「你本来就没开」的情况，它不会自作主张给你打开。
 
@@ -9,6 +11,9 @@
 
 外接显示器时，Stage Manager 的应用条带会吃掉屏幕边缘、干扰窗口拖拽；
 回到单屏时又往往想把它开回来。手动去系统设置里点开关，一天要来回点两次。
+
+Apple 没有公开控制 Stage Manager 的 API——同类项目 StageControl 正因此搁浅。
+本工具的路线是用辅助功能（AX）直接操作系统设置里的真实开关，绕开了这个死路。
 
 ## 工作原理（以及为什么这么绕）
 
