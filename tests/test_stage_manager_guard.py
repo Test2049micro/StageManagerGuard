@@ -273,6 +273,36 @@ def main() -> int:
     check(mod.ROUND_BUDGET > mod.REQUEST_TIMEOUT,
           f"ROUND_BUDGET({mod.ROUND_BUDGET}) 必须 > REQUEST_TIMEOUT({mod.REQUEST_TIMEOUT})")
 
+    # 8k) 状态文件损坏必须留档 + 不静默吞掉（真行为验证，非字符串检查）。
+    #     状态文件是"该恢复成什么"的唯一依据；静默当空会导致：
+    #     单屏时漏恢复、多屏时覆盖记下的 pref_before_close。
+    with tempfile.TemporaryDirectory() as td:
+        orig_state = mod.STATE_PATH
+        mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+        # 正常读取
+        pathlib.Path(mod.STATE_PATH).write_text('{"closed_by_script": true}', encoding="utf-8")
+        check(mod.load_state().get("closed_by_script") is True, "正常状态文件必须能读出")
+        # 损坏：应留档 .corrupt-*，并返回空 dict
+        pathlib.Path(mod.STATE_PATH).write_text('{"closed_by_scri', encoding="utf-8")
+        got = mod.load_state()
+        check(got == {}, f"损坏状态必须返回空 dict，实际 {got!r}")
+        kept = list(pathlib.Path(td).glob("state.json.corrupt-*"))
+        check(len(kept) == 1, f"损坏状态必须改名留档（找到 {len(kept)} 个）")
+        check("closed_by_scri" in kept[0].read_text(encoding="utf-8"),
+              "留档文件必须保留原始损坏内容（供事后追因）")
+        # 文件不存在：不得留档（不是损坏）
+        mod.STATE_PATH = str(pathlib.Path(td) / "nope.json")
+        check(mod.load_state() == {}, "文件不存在时返回空 dict")
+        check(not list(pathlib.Path(td).glob("nope.json.corrupt-*")),
+              "文件不存在时不得产生 .corrupt 留档")
+        mod.STATE_PATH = orig_state
+
+    # 8l) daemon 的 ALREADY 分支也必须更新空闲计时：否则反复处理"已是目标态"
+    #     的请求时计时停在旧值，窗口被误关、下次又要 18–28 秒冷启动
+    already_seg = dsrc.split('if state == "ALREADY"')[1].split("# CLICKED")[0]
+    check("_LAST_ACTIVITY[0] = time.time()" in already_seg,
+          "ALREADY 分支必须更新 _LAST_ACTIVITY（防空闲关窗误判）")
+
     # 8h) inflight 必须有租约回收：daemon 崩溃/无权限时 inflight 会永久驻留，
     #     导致 guard 每轮都走"已有待办"分支，既不重试也不报错，功能静默停滞
     check("_reclaim_stale_inflight" in src and "REQUEST_STALE_AFTER" in src,

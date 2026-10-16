@@ -320,6 +320,10 @@ def do_set(desired: bool) -> tuple[bool, str]:
                 # 短暂不一致。故这里仍要复核 pref，不一致就继续尝试而非谎报成功。
                 pf = pref_enabled()
                 if pf == desired:
+                    # 与 CLICKED 分支一样要记活动时间：否则反复处理"已是目标态"的
+                    # 请求时 _LAST_ACTIVITY 停在旧值，120 秒后窗口被误关，
+                    # 下一次又要 18–28 秒冷启动。
+                    _LAST_ACTIVITY[0] = time.time()
                     return True, f"already {want}"
                 log(f"attempt {attempt}: ui already {want} but pref={pf} (not yet adopted)")
                 time.sleep(RETRY_SLEEP)
