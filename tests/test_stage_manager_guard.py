@@ -297,6 +297,16 @@ def main() -> int:
               "文件不存在时不得产生 .corrupt 留档")
         mod.STATE_PATH = orig_state
 
+    # 8m) 所有子进程调用必须用 subprocess.run，不得用 Popen。
+    #     实证（2026-10-16 独立实验）：alarm 打断 subprocess.run 时，其 except 分支
+    #     会先 kill 子进程再抛异常，不留孤儿；而裸 Popen + wait() 会留孤儿
+    #     （评审据此认为本代码有 M5 孤儿问题，经实测不成立）。
+    #     这条断言把"用 run 不用 Popen"固化为不可回退的约束。
+    for f, name in ((src, "guard"), (dsrc, "daemon")):
+        check("subprocess.Popen" not in f,
+              f"{name} 不得用 subprocess.Popen（会留孤儿；须用 subprocess.run）")
+        check("subprocess.run" in f, f"{name} 必须用 subprocess.run 起子进程")
+
     # 8l) daemon 的 ALREADY 分支也必须更新空闲计时：否则反复处理"已是目标态"
     #     的请求时计时停在旧值，窗口被误关、下次又要 18–28 秒冷启动
     already_seg = dsrc.split('if state == "ALREADY"')[1].split("# CLICKED")[0]
