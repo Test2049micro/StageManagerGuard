@@ -1,5 +1,7 @@
 # StageManagerGuard
 
+[简体中文](README.md) | [English](README.en.md)
+
 **多显示器时自动关闭 macOS 台前调度（Stage Manager），拔掉外接屏后自动恢复原状。**
 
 ![Architecture: guard polls displays and writes request.json, daemon clicks the Stage Manager toggle in System Settings and reports back via result.json](assets/architecture.svg)
@@ -49,7 +51,7 @@ macOS 27 实测（macOS 13+ 同理，未逐一验证）：
 
 ```bash
 git clone https://github.com/Test2049micro/StageManagerGuard.git
-cd stage-manager-guard
+cd StageManagerGuard
 ./install.sh
 ```
 
@@ -58,6 +60,8 @@ cd stage-manager-guard
 > 系统设置 › 隐私与安全性 › 辅助功能 → 勾选 `install.sh` 结束时打印的那个 python3 路径
 
 未授权时 daemon 会持续报 `AppleEvent timed out`，功能不生效（但不会做错事）。
+若看到 osascript 原始报错（"Not authorized to send Apple events"），daemon 会
+把它翻译成同样的指引写进日志，照做即可。
 
 ## 卸载
 
