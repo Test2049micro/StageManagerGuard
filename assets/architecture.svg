@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 230" width="100%" role="img">
+  <title>StageManagerGuard data flow</title>
+  <desc>guard, launched by launchd every 3 seconds, counts displays and writes a request file. The daemon, running in the user session, clicks the Stage Manager checkbox in System Settings and reports the result back via a result file.</desc>
+  <style>
+    svg {
+      --c-blue-50: #E6F1FB; --c-blue-200: #85B7EB; --c-blue-600: #185FA5; --c-blue-800: #0C447C;
+      --c-gray-50: #F1EFE8; --c-gray-200: #B4B2A9; --c-gray-600: #5F5E5A; --c-gray-800: #444441;
+    }
+    @media (prefers-color-scheme: dark) {
+      svg {
+        --c-blue-50: #0C447C; --c-blue-200: #85B7EB; --c-blue-600: #85B7EB; --c-blue-800: #B5D4F4;
+        --c-gray-50: #444441; --c-gray-200: #B4B2A9; --c-gray-600: #B4B2A9; --c-gray-800: #D3D1C7;
+      }
+    }
+    text { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; }
+    .box-title { font-size: 13px; font-weight: 500; dominant-baseline: central; text-anchor: middle; fill: var(--c-blue-800); }
+    .box-sub { font-size: 12px; font-weight: 400; dominant-baseline: central; text-anchor: middle; fill: var(--c-blue-600); }
+    .ext-title { font-size: 13px; font-weight: 500; dominant-baseline: central; text-anchor: middle; fill: var(--c-gray-800); }
+    .ext-sub { font-size: 12px; font-weight: 400; dominant-baseline: central; text-anchor: middle; fill: var(--c-gray-600); }
+    .label { font-size: 12px; font-weight: 400; text-anchor: middle; fill: var(--c-gray-600); }
+    .wire { fill: none; stroke: var(--c-gray-600); stroke-width: 0.5px; }
+    .proc { fill: var(--c-blue-50); stroke: var(--c-blue-600); stroke-width: 0.5px; }
+    .ext { fill: var(--c-gray-50); stroke: var(--c-gray-600); stroke-width: 0.5px; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L8,4 L0,8 z" fill="var(--c-gray-600)"></path>
+    </marker>
+  </defs>
+  <rect x="82" y="70" width="126" height="56" rx="4" class="proc"></rect>
+  <text x="145" y="90" class="box-title">guard</text>
+  <text x="145" y="108" class="box-sub">launchd · 3s poll</text>
+  <rect x="268" y="70" width="126" height="56" rx="4" class="proc"></rect>
+  <text x="331" y="90" class="box-title">daemon</text>
+  <text x="331" y="108" class="box-sub">user session · AX</text>
+  <rect x="454" y="70" width="144" height="56" rx="4" class="ext"></rect>
+  <text x="526" y="90" class="ext-title">System Settings</text>
+  <text x="526" y="108" class="ext-sub">Stage Manager toggle</text>
+  <line x1="208" y1="98" x2="268" y2="98" class="wire" marker-end="url(#arrow)"></line>
+  <text x="238" y="86" class="label">request.json</text>
+  <line x1="394" y1="98" x2="454" y2="98" class="wire" marker-end="url(#arrow)"></line>
+  <text x="424" y="86" class="label">AX click</text>
+  <polyline points="331,126 331,175 145,175 145,130" class="wire" marker-end="url(#arrow)"></polyline>
+  <text x="238" y="168" class="label">result.json (ok / fail)</text>
+</svg>
