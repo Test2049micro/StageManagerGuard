@@ -43,7 +43,7 @@ macOS 27 实测（macOS 13+ 同理，未逐一验证）：
 要求：macOS 13+（Stage Manager 引入版本），Command Line Tools（`xcode-select --install`）。
 
 ```bash
-git clone <本仓库>
+git clone https://github.com/Test2049micro/StageManagerGuard.git
 cd stage-manager-guard
 ./install.sh
 ```
