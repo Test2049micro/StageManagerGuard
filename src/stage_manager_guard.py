@@ -253,7 +253,17 @@ def _next_seq() -> int:
     return base
 
 
-def wait_result(start_ts: float, timeout: float | None = 0) -> tuple[bool, str]:
+def _rollback_marker(state: dict) -> None:
+    """把一笔关闭账整笔划掉（标记与其四个附属键）。失败/未派发时调用。"""
+    state.pop("closed_by_script", None)
+    for k in ("closed_at", "screens_at_close", "pref_before_close",
+              "closed_by_seq"):
+        state.pop(k, None)
+    save_state(state)
+
+
+def wait_result(start_ts: float, timeout: float | None = 0,
+                expected_seq: int | None = None) -> tuple[bool, str]:
     """读 result.json，只认**晚于本次请求**写回的结果，避免把上一轮的旧结果当成本轮成败。
 
     timeout 语义（曾在此踩坑，勿改）：
@@ -277,6 +287,14 @@ def wait_result(start_ts: float, timeout: float | None = 0) -> tuple[bool, str]:
             at = r.get("at")
             # 严格大于请求发起时刻：同一秒内写回的旧结果不予采信
             if at and _iso_ts(at) > start_ts:
+                # 只采信"我们要的那条请求"的结果：A 被超时回收后 B 已派发，
+                # A 的结果晚到时若不验 seq，就会把 A 的失败记到 B 头上
+                # （评审二轮 P1-2）。不匹配就当没看见，继续等到预算耗尽。
+                if expected_seq is not None and r.get("seq") != expected_seq:
+                    time.sleep(1.0)
+                    if time.time() >= deadline:
+                        break
+                    continue
                 _LAST_RESULT_SEQ = r.get("seq")
                 return bool(r.get("ok")), str(r.get("msg", ""))
         except Exception:
@@ -359,12 +377,14 @@ def set_stage_manager(desired: bool, dry_run: bool = False,
             budget = max(0.0, started + REQUEST_TIMEOUT - time.time())
             if pending.get("action") != my_action:
                 # 对向动作尚未收尾：等它落地，但绝不把它的结果记到本轮头上——
-                # 否则单屏恢复会把"off 成功"误当"恢复成功"，反之亦然
-                # （评审席 P1-3 的姊妹路径）。下一轮按真实 pref 重新决策。
-                wait_result(started, timeout=budget)
+                # 否则单屏恢复会把"off 成功"误当"恢复成功"，反之亦然。
+                # expected_seq 钉死只采信那条请求的结果（弃之不用，只为等它收尾）。
+                wait_result(started, timeout=budget,
+                            expected_seq=pending.get("seq"))
                 return False, "in-flight (opposite action pending)"
             log(f"request already pending (seq={pending.get('seq')}); waiting for its result")
-            return wait_result(started, timeout=budget)
+            return wait_result(started, timeout=budget,
+                               expected_seq=pending.get("seq"))
 
     # 先清掉上一轮结果，避免把旧结果当成本轮成败
     try:
@@ -379,7 +399,7 @@ def set_stage_manager(desired: bool, dry_run: bool = False,
     # 不会起新实例），所以阻塞不会丢轮；而"下发就走、下轮再收"曾导致
     # closed_by_script 永远无人收集（下轮 pref 已翻转，走 already off 分支跳过收集），
     # 单屏恢复整条链路静默失效。
-    return wait_result(started, timeout=REQUEST_TIMEOUT)
+    return wait_result(started, timeout=REQUEST_TIMEOUT, expected_seq=seq)
 
 
 # ---------- 主逻辑 ----------
@@ -416,6 +436,22 @@ def _run_inner(dry_run: bool = False) -> int:
     state = load_state()
     log(f"screens={n} pref_enabled={pf} action={action}")
 
+    # 对账 sweep：上一条请求的结果可能在两轮之间才落地，甚至从未被任何
+    # wait 窗口采信就躺在这里——fresh-dispatch 的"先清旧结果"会把它删掉，
+    # 账本里的标记就永远等不到对账（评审二轮 P1-3）。因此开分支前先对：
+    # 失败 → 当场回滚标记；成功 → 账实相符，标记留任。
+    if not dry_run and state.get("closed_by_seq") is not None:
+        try:
+            with open(RESULT_PATH, encoding="utf-8") as f:
+                _r = json.load(f)
+            if _r.get("seq") == state.get("closed_by_seq") and _r.get("ok") is False:
+                log(f"reconcile: result for seq={_r.get('seq')} reports failure; "
+                    f"rolling back marker")
+                _rollback_marker(state)
+                state = load_state()
+        except Exception:
+            pass
+
     if action == "off":
         # pf == True 表示台前调度当前「开着」，正是要关的对象；
         # pf is False 表示已经是关闭态，无需再动 GUI。
@@ -428,6 +464,13 @@ def _run_inner(dry_run: bool = False) -> int:
                 log("already off (closed by script earlier); keeping restore marker")
             else:
                 log("already off (turned off by user); nothing to do")
+            return 0
+        # 对向（restore）动作还没收尾时，连账本都不动（评审二轮 P1-5）：
+        # 此时派发也会被对向 pending 顶回来，先落一笔"没发生的关闭"只会
+        # 留下无人对账的假标记。延后整轮决策，下一轮按真实状态重来。
+        _peek = _pending_request()
+        if _peek is not None and _peek.get("action") != "off":
+            log("opposite (restore) request pending; deferring off this round")
             return 0
         # 下发即记账：标记（连同本周期请求的 seq）在请求发出**之前**落盘。
         # 为什么必须写在派发之前而不是"调用返回之后"：等结果的窗口会被 alarm
@@ -449,7 +492,18 @@ def _run_inner(dry_run: bool = False) -> int:
                 # 账本写不进去就不许派发：恢复依据落不了盘，宁可这轮不动 GUI
                 log("cannot persist close marker; refusing to dispatch (fail-safe)")
                 return 2
-        ok, msg = set_stage_manager(False, dry_run=dry_run, seq=seq)
+        try:
+            ok, msg = set_stage_manager(False, dry_run=dry_run, seq=seq)
+        except _RoundTimeout:
+            raise    # alarm 砍在结果等待上：请求已出门，标记必须保留（P1-1 语义）
+        except Exception:
+            # 派发本身失败（write_request 抛错等）：这笔账没发生，立即回滚
+            # （评审二轮 P1-1）。进程在"存账"与"派发"两步之间被杀的窗口
+            # （ms 级）仍存在，留作已知残余。
+            if seq is not None:
+                log("dispatch failed before request left; rolling back marker")
+                _rollback_marker(state)
+            return 2
         log(f"turn OFF: {msg}")
         if not ok:
             # in-flight：请求已下发、守护进程正在点，尚未有结果。不是失败，
@@ -462,11 +516,7 @@ def _run_inner(dry_run: bool = False) -> int:
                 if (not dry_run
                         and state.get("closed_by_seq") is not None
                         and state.get("closed_by_seq") == _LAST_RESULT_SEQ):
-                    state.pop("closed_by_script", None)
-                    for k in ("closed_at", "screens_at_close", "pref_before_close",
-                              "closed_by_seq"):
-                        state.pop(k, None)
-                    save_state(state)
+                    _rollback_marker(state)
                 return 1
             return 0
         return 0
@@ -478,11 +528,14 @@ def _run_inner(dry_run: bool = False) -> int:
     prev = state.get("pref_before_close")
     want = bool(prev) if isinstance(prev, bool) else False
     if pf is want:
-        if _pending_request() is not None:
+        pending = _pending_request()
+        if pending is not None and not _reclaim_stale_inflight(pending):
             # 还有请求没收尾（典型：插屏瞬间的 off 请求仍在点击队列里）。
             # 此刻清标记，等 daemon 把 off 点成 pf=False 后，就没有任何账本
             # 记得"该恢复成 True"了——单屏停留在关态且无人负责（评审席 P1-3）。
-            # 延后清账，下一轮按真实 pref 重新决策。
+            # 延后清账，下一轮按真实 pref 重新决策。已 stale 的请求在这里
+            # 顺手回收（回收逻辑原本只在派发路径跑，门闩路径会让死账本
+            # 永远推迟清标记——我席复审发现）。
             log("pending request still in flight; deferring marker clear")
             return 0
         log(f"already restored (pref={pf}); clearing flag")

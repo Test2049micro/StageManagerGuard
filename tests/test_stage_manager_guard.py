@@ -18,7 +18,7 @@ import pathlib
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = pathlib.Path(__file__).resolve().parent
 SRC = HERE.parent / "src" / "stage_manager_guard.py"
@@ -188,7 +188,7 @@ def main() -> int:
     # 2j) restore 分支 pending 门闩：pf 已等于恢复目标但还有请求没收尾
     #     （插屏瞬间的 off 仍在点击队列）→ 不得清标记，否则 off 点成之后
     #     单屏停留在关态且无人负责（评审席 P1-3）
-    def run_pending_gate(pending_req):
+    def run_pending_gate(pending_req, at_age=0.0):
         with tempfile.TemporaryDirectory() as td:
             mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
             mod.REQ_DIR = td
@@ -200,20 +200,114 @@ def main() -> int:
                  "closed_by_seq": 1}), encoding="utf-8")
             mod.screen_count = lambda: 1
             mod.pref_enabled = lambda: True
-            mod._pending_request = (lambda: pending_req) if pending_req \
-                else lambda: None
+            if pending_req is not None:
+                pending_req = dict(pending_req)
+                pending_req["at"] = datetime.now(
+                    timezone.utc).isoformat() if at_age == 0.0 else \
+                    (datetime.now(timezone.utc)
+                     - timedelta(seconds=at_age)).isoformat()
+                pathlib.Path(mod.INFLIGHT_PATH).write_text(
+                    json.dumps(pending_req), encoding="utf-8")
+            orig_pending = mod._pending_request
+            mod._pending_request = lambda: pending_req
             mod.set_stage_manager = lambda desired, dry_run=False, seq=None: (
                 (_ for _ in ()).throw(AssertionError("此路径不得派发请求")))
-            rc = mod.run(dry_run=False)
+            try:
+                rc = mod.run(dry_run=False)
+            finally:
+                mod._pending_request = orig_pending
             saved = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
-            return rc, saved
+            inflight_left = pathlib.Path(mod.INFLIGHT_PATH).exists()
+            return rc, saved, inflight_left
 
-    rc8, saved8 = run_pending_gate({"action": "off", "seq": 1})
-    check(rc8 == 0 and saved8.get("closed_by_script") is True,
-          "pending 未收尾时不得清标记（延后清账）")
-    rc9, saved9 = run_pending_gate(None)
+    rc8, saved8, left8 = run_pending_gate({"action": "off", "seq": 1})
+    check(rc8 == 0 and saved8.get("closed_by_script") is True and left8,
+          "新鲜 pending 未收尾时不得清标记（延后清账）")
+    rc9, saved9, _ = run_pending_gate(None)
     check(rc9 == 0 and "closed_by_script" not in saved9,
           "无 pending 时 pf 已达标照常清标记（自愈路径仍在）")
+    # stale 账（>180s 无进展，daemon 已死）在门闩处被回收 → 放行清标记，
+    # 不许死账本把清标记无限期推迟（我席复审发现）
+    rc10, saved10, left10 = run_pending_gate({"action": "off", "seq": 1},
+                                             at_age=mod.REQUEST_STALE_AFTER + 10)
+    check(rc10 == 0 and "closed_by_script" not in saved10 and not left10,
+          "stale pending 在门闩处回收后放行清标记（不死锁）")
+
+    # 2k) 派发本身失败（write_request 抛错等）必须回滚刚落的账（评审二轮 P1-1）；
+    #     在调用体内确认"账已落、随后被回滚"的完整轨迹
+    with tempfile.TemporaryDirectory() as td:
+        mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+        mod.REQ_DIR = td
+        mod.REQ_PATH = str(pathlib.Path(td) / "request.json")
+        mod.INFLIGHT_PATH = str(pathlib.Path(td) / "request.inflight")
+        mod.RESULT_PATH = str(pathlib.Path(td) / "result.json")
+        mod.screen_count = lambda: 3
+        mod.pref_enabled = lambda: True
+        seen2: dict = {}
+
+        def exploding_dispatch(desired, dry_run=False, seq=None):
+            st = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
+            seen2["marker_during"] = (st.get("closed_by_script") is True
+                                      and st.get("closed_by_seq") == seq)
+            raise OSError("simulated write_request failure")
+
+        mod.set_stage_manager = exploding_dispatch
+        rcX = mod.run(dry_run=False)
+        savedX = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
+    check(rcX == 2 and seen2.get("marker_during") is True
+          and "closed_by_script" not in savedX and "closed_by_seq" not in savedX,
+          "派发失败必须回滚本轮已落的账（假标记不留夜）")
+
+    # 2m) 对账 sweep：超时请求的失败结果在两轮之间落地、从未被 wait 窗口采信，
+    #     开分支前必须与账本对上并回滚（评审二轮 P1-3——否则 fresh-dispatch
+    #     的"清旧结果"会把唯一一次对账机会删掉）
+    with tempfile.TemporaryDirectory() as td:
+        mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+        mod.REQ_DIR = td
+        mod.REQ_PATH = str(pathlib.Path(td) / "request.json")
+        mod.INFLIGHT_PATH = str(pathlib.Path(td) / "request.inflight")
+        mod.RESULT_PATH = str(pathlib.Path(td) / "result.json")
+        pathlib.Path(mod.STATE_PATH).write_text(json.dumps(
+            {"closed_by_script": True, "pref_before_close": True,
+             "closed_by_seq": 7}), encoding="utf-8")
+        pathlib.Path(mod.RESULT_PATH).write_text(json.dumps(
+            {"ok": False, "msg": "failed after 5 attempts", "seq": 7,
+             "at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        mod.screen_count = lambda: 3
+        mod.pref_enabled = lambda: False
+        mod.set_stage_manager = lambda desired, dry_run=False, seq=None: (
+            (_ for _ in ()).throw(AssertionError("对账路径不得派发")))
+        rcY = mod.run(dry_run=False)
+        savedY = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
+    check(rcY == 0 and "closed_by_script" not in savedY
+          and "closed_by_seq" not in savedY,
+          "躺着的失败结果必须在 sweep 中与账本对账并回滚标记")
+
+    # 2n) 对向（restore）请求未收尾时，off 连账本都不动、也不派发（评审二轮 P1-5）
+    with tempfile.TemporaryDirectory() as td:
+        mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+        mod.REQ_DIR = td
+        mod.REQ_PATH = str(pathlib.Path(td) / "request.json")
+        mod.INFLIGHT_PATH = str(pathlib.Path(td) / "request.inflight")
+        mod.RESULT_PATH = str(pathlib.Path(td) / "result.json")
+        pathlib.Path(mod.INFLIGHT_PATH).write_text(json.dumps(
+            {"action": "restore", "seq": 9,
+             "at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        mod.screen_count = lambda: 3
+        mod.pref_enabled = lambda: True
+        orig_pending = mod._pending_request
+        mod._pending_request = lambda: json.loads(
+            pathlib.Path(mod.INFLIGHT_PATH).read_text(encoding="utf-8"))
+        mod.set_stage_manager = lambda desired, dry_run=False, seq=None: (
+            (_ for _ in ()).throw(AssertionError("对向让位时不得派发")))
+        try:
+            rcZ = mod.run(dry_run=False)
+        finally:
+            mod._pending_request = orig_pending
+        savedZ = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8")) \
+            if pathlib.Path(mod.STATE_PATH).exists() else {}
+    check(rcZ == 0 and "closed_by_script" not in savedZ,
+          "对向请求未收尾时不得落账也不得派发")
 
     # 4) 计数读不到必须中止（退出码 2），不得当单屏
     with tempfile.TemporaryDirectory() as td:
@@ -404,6 +498,36 @@ def main() -> int:
         check(ok_d is False and "cannot open" in msg_d,
               f"daemon 报失败必须如实上抛，实际 ok={ok_d} msg={msg_d!r}")
 
+        # 场景 E：接线必须为真——采信结果时 _LAST_RESULT_SEQ 必须真的从
+        # result 文件读到 seq。2i/2h 靠手工注入 _LAST_RESULT_SEQ 模拟对账，
+        # 若这里没接线（或 daemon 忘了回传 seq），那些测试会集体空转
+        # 而无人察觉——注入式测试必须配一条真实接线测试。
+        pathlib.Path(mod.RESULT_PATH).write_text(json.dumps(
+            {"ok": False, "msg": "failed after 5 attempts", "seq": 424242,
+             "at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        mod._LAST_RESULT_SEQ = None
+        ok_e, _ = mod.wait_result(time.time() - 5, timeout=0)
+        check(ok_e is False and mod._LAST_RESULT_SEQ == 424242,
+              f"wait_result 采信结果时必须更新 _LAST_RESULT_SEQ（实际={mod._LAST_RESULT_SEQ}）")
+
+        # 场景 F：expected_seq 不匹配的结果不得采信——A 被超时回收后 B 已派发，
+        # A 的结果晚到时若不验 seq，A 的失败会记到 B 头上（评审二轮 P1-2）
+        pathlib.Path(mod.RESULT_PATH).write_text(json.dumps(
+            {"ok": False, "msg": "failed (request A)", "seq": 111,
+             "at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        mod._LAST_RESULT_SEQ = None
+        ok_f, msg_f = mod.wait_result(time.time() - 5, timeout=1.5, expected_seq=222)
+        check(ok_f is False and "in-flight" in msg_f
+              and mod._LAST_RESULT_SEQ is None,
+              f"seq 不匹配的结果不得采信（实际 seq={mod._LAST_RESULT_SEQ}, msg={msg_f!r}）")
+        # 场景 G：expected_seq 匹配时照常采信
+        pathlib.Path(mod.RESULT_PATH).write_text(json.dumps(
+            {"ok": False, "msg": "failed (request B)", "seq": 222,
+             "at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        ok_g, _ = mod.wait_result(time.time() - 5, timeout=0, expected_seq=222)
+        check(ok_g is False and mod._LAST_RESULT_SEQ == 222,
+              f"expected_seq 匹配时必须采信（实际={mod._LAST_RESULT_SEQ}）")
+
     # 8d2) 非阻塞不得退化成"不看"：这是上面 A 场景存在的原因
     check("if timeout is None" in src and "while True" in src,
           "wait_result 必须先看结果再判断是否继续等（早期 while time<deadline 会一次都不看）")
@@ -548,6 +672,22 @@ def main() -> int:
     # 两个滞后分支都必须真的调用它（防"只定义不调用"）
     check(dsrc.count("await_pref_adopted(") >= 3,
           "ALREADY 与 CLICKED 两个滞后分支必须实际调用 await_pref_adopted")
+
+    # 10b) daemon 侧接线：write_result 必须把请求里的 seq 回传进 result.json
+    #      ——guard 的跨轮回滚全靠它对账，少了它整条 2i 路径哑火
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        orig_result_path = sd.RESULT_PATH
+        sd.RESULT_PATH = str(pathlib.Path(_td) / "result.json")
+        try:
+            sd.write_result(False, "failed after 5 attempts",
+                            {"action": "off", "seq": 31337})
+            payload = json.loads(pathlib.Path(sd.RESULT_PATH).read_text(encoding="utf-8"))
+        finally:
+            sd.RESULT_PATH = orig_result_path
+    check(payload.get("ok") is False and payload.get("seq") == 31337
+          and payload.get("requested") == "off",
+          "write_result 必须回传 seq（跨轮回滚的对账依据）")
 
     failed = [m for ok, m in results if not ok]
     for ok, m in results:
