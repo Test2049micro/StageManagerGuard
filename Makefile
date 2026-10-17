@@ -9,6 +9,8 @@ test: build
 	python3 -u tests/test_fuzz.py 20261017
 	python3 -u tests/test_fuzz.py 1
 	python3 -u tests/test_fuzz.py 42
+	python3 -u tests/test_chaos.py 20261017 10
+	python3 -u tests/test_chaos.py 7 10
 
 install:
 	./install.sh
