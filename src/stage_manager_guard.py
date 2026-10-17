@@ -65,6 +65,9 @@ PROBE_ATTEMPTS = 2                     # 探测重试次数（单次超时是瞬
 PROBE_RETRY_SLEEP = 1.0
 REQUEST_TIMEOUT = 90                   # 等 sm_daemon 点完开关的上限（含其内部重试）
 REQUEST_STALE_AFTER = 180              # inflight 请求超过此时长未完成即回收重发（防静默停滞）
+# 时间戳指向未来的容忍度（时钟偏差余量）。超过它的"未来 at"按畸形处理：
+# 否则一个 at=2999 年的 inflight 能把 off/restore 门闩永远挡住（红队 #11）
+_FUTURE_TOLERANCE = 60.0
 
 # 单轮总时限（秒）。launchd 每 3 秒唤起一次，任何子进程卡住（实测出现过
 # subprocess.run 的 wait 永久阻塞、子进程已消失但父进程等不到——__semwait_signal）
@@ -146,10 +149,16 @@ def run_probe(sub: str) -> dict:
 
 
 def screen_count() -> int | None:
-    """在役显示器数（NSScreen 口径）。读不到返回 None，调用方不得当成 1。"""
+    """在役显示器数（NSScreen 口径）。读不到/类型不可信返回 None，调用方不得当成 1。
+
+    bool 是 int 子类：探测输出若混进 true 会被 int() 成 1（=单屏），
+    驱动一次错误的"恢复"——这里必须把 bool 挡掉（红队 #13）。
+    """
     d = run_probe("screens")
     n = d.get("screens")
-    return int(n) if isinstance(n, int) else None
+    if isinstance(n, bool) or not isinstance(n, int):
+        return None
+    return n
 
 
 def pref_enabled() -> bool | None:
@@ -171,7 +180,21 @@ def load_state() -> dict:
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            raise ValueError("state is not a JSON object")
+        # 类型可信门槛：账本值类型不对 = 整份账本不可信（对抗套件 A2/A4——
+        # 真值字符串 "yes" 会驱动恢复决策、字符串 seq 会与整数结果错配）。
+        # 验不过就走下面的隔离路径，宁可当无账本也不认这笔账。
+        _cbs = data.get("closed_by_script")
+        if _cbs is not None and not isinstance(_cbs, bool):
+            raise ValueError("closed_by_script is not bool")
+        _pbc = data.get("pref_before_close")
+        if _pbc is not None and not isinstance(_pbc, bool):
+            raise ValueError("pref_before_close is not bool")
+        _seq = data.get("closed_by_seq")
+        if _seq is not None and (not isinstance(_seq, int) or isinstance(_seq, bool)):
+            raise ValueError("closed_by_seq is not int")
+        return data
     except FileNotFoundError:
         return {}
     except Exception as e:
@@ -189,7 +212,10 @@ def save_state(state: dict) -> bool:
     try:
         os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
         tmp = STATE_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        # O_NOFOLLOW：tmp 若被换成符号链接，写入会顺着链接改掉目录外的文件
+        # （红队 #8）；拒写并失败，绝不跟随
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         os.replace(tmp, STATE_PATH)
         return True
@@ -228,7 +254,10 @@ def write_request(action: str, restore_to: bool = False, seq: int | None = None)
         "seq": seq,
     }
     tmp = REQ_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    # O_NOFOLLOW：同 save_state——tmp 不许是符号链接（红队 #8）。
+    # 写失败直接抛给调用方的 dispatch 异常处理（回滚标记，rc=2）
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, REQ_PATH)
     return seq
@@ -287,16 +316,29 @@ def wait_result(start_ts: float, timeout: float | None = 0,
             at = r.get("at")
             # 严格大于请求发起时刻：同一秒内写回的旧结果不予采信
             if at and _iso_ts(at) > start_ts:
-                # 只采信"我们要的那条请求"的结果：A 被超时回收后 B 已派发，
-                # A 的结果晚到时若不验 seq，就会把 A 的失败记到 B 头上
-                # （评审二轮 P1-2）。不匹配就当没看见，继续等到预算耗尽。
-                if expected_seq is not None and r.get("seq") != expected_seq:
+                # ok 必须是 bool 才采信：bool("false") 是真值，字符串 "false"
+                # 会被当成成功（红队 #4）。非 bool 一律视为没等到，继续等。
+                _ok = r.get("ok")
+                if not isinstance(_ok, bool):
                     time.sleep(1.0)
                     if time.time() >= deadline:
                         break
                     continue
-                _LAST_RESULT_SEQ = r.get("seq")
-                return bool(r.get("ok")), str(r.get("msg", ""))
+                # 只采信"我们要的那条请求"的结果：A 被超时回收后 B 已派发，
+                # A 的结果晚到时若不验 seq，就会把 A 的失败记到 B 头上
+                # （评审二轮 P1-2）。seq 还必须严格是 int（bool 是 int 子类，
+                # True==1；浮点 7.0==7——弱类型会让伪造值配对，对抗套件边界）。
+                # 不匹配就当没看见，继续等到预算耗尽。
+                _r_seq = r.get("seq")
+                if expected_seq is not None and (
+                        not isinstance(_r_seq, int) or isinstance(_r_seq, bool)
+                        or _r_seq != expected_seq):
+                    time.sleep(1.0)
+                    if time.time() >= deadline:
+                        break
+                    continue
+                _LAST_RESULT_SEQ = _r_seq
+                return _ok, str(r.get("msg", ""))
         except Exception:
             pass
         if time.time() >= deadline:
@@ -318,12 +360,22 @@ def _pending_request() -> dict | None:
     两个文件都要看：守护进程为防止同一条请求被重复处理，会先把 request.json
     改名成 request.inflight 再慢慢点开关。若只看 request.json，会在这段
     "正在点"的窗口里误判为"没有待办"而重复下发，把动作抵消掉。
+    非 dict 的 JSON（数组/字符串等）隔离留档后当没有待办——直接返回会让
+    上层 .get 把整轮崩掉（红队 #10 guard 侧）。
     """
     for p in (REQ_PATH, INFLIGHT_PATH):
         try:
             with open(p, encoding="utf-8") as f:
-                return json.load(f)
+                cand = json.load(f)
+            if not isinstance(cand, dict):
+                raise ValueError("pending file is not a JSON object")
+            return cand
         except Exception:
+            try:
+                os.replace(p, f"{p}.corrupt-{int(time.time())}")
+                log(f"quarantined malformed pending file: {p}")
+            except OSError:
+                pass
             continue
     return None
 
@@ -337,17 +389,27 @@ def _reclaim_stale_inflight(pending: dict) -> bool:
     """
     at = pending.get("at")
     age = time.time() - (_iso_ts(at) if at else 0)
-    if age < REQUEST_STALE_AFTER:
+    # 未来时间戳（超容忍度）= 畸形请求，同样走回收：它既不可信也不该挡门闩
+    if -_FUTURE_TOLERANCE <= age < REQUEST_STALE_AFTER:
         return False
-    log(f"inflight request stale ({age:.0f}s > {REQUEST_STALE_AFTER}s); reclaiming")
-    try:
-        os.remove(INFLIGHT_PATH)
-    except OSError:
-        pass
-    try:
-        os.remove(REQ_PATH)
-    except OSError:
-        pass
+    log(f"inflight request stale or malformed time (age={age:.0f}s); reclaiming")
+
+    def _seq_of(path: str):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f).get("seq")
+        except Exception:
+            return None
+
+    # 只删"确实是这笔账"的文件：旧 request.json 过期回收时，不同 seq 的新鲜
+    # inflight 不能被连带删掉——否则正在点击的租约凭空消失，guard 会派出
+    # 与之重叠的新请求（红队 #7）
+    for path in (REQ_PATH, INFLIGHT_PATH):
+        if _seq_of(path) == pending.get("seq"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     return True
 
 
@@ -423,7 +485,11 @@ def run(dry_run: bool = False) -> int:
 
 def _run_inner(dry_run: bool = False) -> int:
     n = screen_count()
-    if n is None:
+    # 纵深防御：计数类型在这里再验一次，不只依赖 screen_count()——
+    # 任何绕过探测类型检查的路径（未来重构、敌意输入）都不得让 "3" > 1
+    # 这类弱类型比较走进决策（对抗套件 C4/C5）。<1 屏同样是不可信读数
+    # （红队 #13：0/-1 无物理意义，宁可不猜）
+    if n is None or not isinstance(n, int) or isinstance(n, bool) or n < 1:
         log("ABORT: cannot determine screen count (probe failed) — refusing to guess")
         return 2
     pf = pref_enabled()
@@ -444,8 +510,11 @@ def _run_inner(dry_run: bool = False) -> int:
         try:
             with open(RESULT_PATH, encoding="utf-8") as f:
                 _r = json.load(f)
-            if _r.get("seq") == state.get("closed_by_seq") and _r.get("ok") is False:
-                log(f"reconcile: result for seq={_r.get('seq')} reports failure; "
+            _r_seq = _r.get("seq")
+            if (isinstance(_r_seq, int) and not isinstance(_r_seq, bool)
+                    and _r_seq == state.get("closed_by_seq")
+                    and _r.get("ok") is False):
+                log(f"reconcile: result for seq={_r_seq} reports failure; "
                     f"rolling back marker")
                 _rollback_marker(state)
                 state = load_state()
@@ -470,8 +539,14 @@ def _run_inner(dry_run: bool = False) -> int:
         # 留下无人对账的假标记。延后整轮决策，下一轮按真实状态重来。
         _peek = _pending_request()
         if _peek is not None and _peek.get("action") != "off":
-            log("opposite (restore) request pending; deferring off this round")
-            return 0
+            # stale 的（含未知 action 的垃圾请求）就地回收后放行；只有新鲜
+            # 的对向请求才值得整轮延后——否则一个坏文件能把 off 卡死到天荒地老
+            # （对抗套件 C2）
+            if _reclaim_stale_inflight(_peek):
+                log("stale/unknown inflight reclaimed at off gate; proceeding")
+            else:
+                log("opposite (restore) request pending; deferring off this round")
+                return 0
         # 下发即记账：标记（连同本周期请求的 seq）在请求发出**之前**落盘。
         # 为什么必须写在派发之前而不是"调用返回之后"：等结果的窗口会被 alarm
         # 截断（探测最坏 62s + 等待 90s 曾把预算顶到 152>150），截断路径下
@@ -526,7 +601,12 @@ def _run_inner(dry_run: bool = False) -> int:
         log("single screen and nothing was closed by script; nothing to restore")
         return 0
     prev = state.get("pref_before_close")
-    want = bool(prev) if isinstance(prev, bool) else False
+    if not isinstance(prev, bool):
+        # 账本说"我关的"却没记"关之前是什么"（旧版本升级残留/字段缺失）：
+        # 宁可不动也不猜——猜 False 会在单屏把用户正开着的台前调度关掉（红队 #5）
+        log("restore marker without trustworthy pref_before_close; refusing to guess")
+        return 2
+    want = prev
     if pf is want:
         pending = _pending_request()
         if pending is not None and not _reclaim_stale_inflight(pending):
@@ -542,7 +622,10 @@ def _run_inner(dry_run: bool = False) -> int:
         state.pop("closed_by_script", None)
         state.pop("closed_by_seq", None)
         state["restored_at"] = datetime.now(timezone.utc).isoformat()
-        save_state(state)
+        if not save_state(state):
+            # 清账写不进盘不许报成功：否则每轮重复处理同一笔账（红队 #9）
+            log("cannot persist marker clear; reporting failure (no false success)")
+            return 2
         return 0
     ok, msg = set_stage_manager(want, dry_run=dry_run)
     log(f"restore to {want}: {msg}")
@@ -556,7 +639,9 @@ def _run_inner(dry_run: bool = False) -> int:
         state.pop("closed_by_seq", None)
         state["restored_at"] = datetime.now(timezone.utc).isoformat()
         state["screens_at_restore"] = n
-        save_state(state)
+        if not save_state(state):
+            log("cannot persist restore completion; reporting failure (no false success)")
+            return 2
     return 0
 
 

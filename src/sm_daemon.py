@@ -438,10 +438,23 @@ def load_last_seq():
         return None
 
 
+# 正常 seq = time_ns 量级（~1.8e18），永远小于 2^63。超过它的必是伪造：
+# 落进水位会让所有后续正常请求被永久跳过（红队 #2 的巨数毒化）
+SEQ_MAX = (1 << 63) - 1
+
+
+def _valid_seq(v) -> bool:
+    """请求 seq 必须是严格的正整数：bool（True==1）、浮点（7.0==7）、
+    负数/零、超过 2^63 的巨数一律拒收（红队 #2/#14）。"""
+    return isinstance(v, int) and not isinstance(v, bool) and 0 < v <= SEQ_MAX
+
+
 def save_last_seq(seq: int) -> None:
     try:
         tmp = SEQ_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        # O_NOFOLLOW：tmp 不许是符号链接（红队 #8 的 daemon 侧同款）
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"seq": seq}, f)
         os.replace(tmp, SEQ_PATH)
     except OSError:
@@ -471,26 +484,57 @@ def process_once() -> bool:
         except OSError:
             pass
         return True
+    if not isinstance(req, dict):
+        # 数组/字符串等非对象请求：json.load 能吃下去，随后的 req.get 会
+        # AttributeError 崩掉主循环且 inflight 永久残留（红队 #10）。
+        # 回报失败并收尾，绝不带着它继续。
+        log(f"rejecting malformed request (not an object): {req!r}"[:120])
+        write_result(False, "malformed request (not an object)", {})
+        try:
+            os.remove(INFLIGHT_PATH)
+        except OSError:
+            pass
+        return True
 
     action = req.get("action")
     if action not in ("off", "restore"):
         log(f"ignoring unknown request action={action!r}")
+        try:
+            os.remove(INFLIGHT_PATH)
+        except OSError:
+            pass
         return True
 
     # 请求里带 seq（单调递增）：守护进程只处理比上次更新的 seq，
     # 这样 guard 连续写多个请求时不会拿旧请求覆盖新意图。
     seq = req.get("seq")
+    if not _valid_seq(seq):
+        # 非法 seq（bool/浮点/负数/巨数）：不执行、不污染水位，回报失败并收尾
+        log(f"rejecting request with malformed seq={seq!r} action={action}")
+        write_result(False, f"malformed seq {seq!r}", req)
+        try:
+            os.remove(INFLIGHT_PATH)
+        except OSError:
+            pass
+        return True
     last_seq = load_last_seq()
-    if isinstance(seq, int) and isinstance(last_seq, int) and seq <= last_seq:
+    if isinstance(last_seq, int) and seq <= last_seq:
         log(f"skipping stale request seq={seq} (last={last_seq}) action={action}")
+        # 跳过也要清 inflight：留着它会让 guard 的 pending 判定永远看到
+        # 一笔"待办"（红队 #2 的残留部分）
+        try:
+            os.remove(INFLIGHT_PATH)
+        except OSError:
+            pass
         return True
 
-    desired = (action == "restore") and bool(req.get("restore_to", False))
+    # restore_to 必须严格是 True 才当真：bool("false") 是真值，字符串
+    # "false" 不得驱动一次反向操作（红队 #1 的 daemon 侧防线）
+    desired = (action == "restore") and req.get("restore_to") is True
     log(f"handling request seq={seq} action={action} desired_enabled={desired}")
     ok, msg = do_set_guarded(desired)
     log(f"request {action} -> ok={ok} {msg}")
-    if isinstance(seq, int):
-        save_last_seq(seq)
+    save_last_seq(seq)
     write_result(ok, msg, req)
     try:
         os.remove(INFLIGHT_PATH)
