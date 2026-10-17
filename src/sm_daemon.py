@@ -220,8 +220,9 @@ def await_pref_adopted(desired: bool, wait: float = PREF_LAG_WAIT) -> bool:
     """
     deadline = time.time() + wait
     while True:
-        # 先查截止再读：defaults 读本身可能慢（超时上限 15s），后查会让 wait
-        # 形同虚设（评审席 P2-4）。最坏只多一次读，外层重试兜底。
+        # 先查截止再读：把超出窗口的读数压到最坏一次（读本身有 15s 超时上限，
+        # 无法中断——评审二轮 P2-7 指出"硬上限"说不过去，改为由外层
+        # RETRY_LIMIT 预算兜底，这里只负责不再每轮都白等满窗口）。
         if time.time() >= deadline:
             return False
         if pref_enabled() == desired:
