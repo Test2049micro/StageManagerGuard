@@ -21,3 +21,9 @@ jobs:
       - name: Adversarial tests
         # 对抗套件：敌意文件/类型/时序下守卫的底线（I1 不动 GUI / I2 结果不翻账 / I3 不静默错账）
         run: python3 -u tests/test_adversarial.py
+      - name: Fuzz (property-based)
+        # 模糊层：随机组合世界×文件状态数千轮，断言安全不变式（固定种子可复现）
+        run: |
+          python3 -u tests/test_fuzz.py 20261017
+          python3 -u tests/test_fuzz.py 1
+          python3 -u tests/test_fuzz.py 42
