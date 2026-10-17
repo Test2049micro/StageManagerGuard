@@ -404,20 +404,37 @@ def _run_inner(dry_run: bool = False) -> int:
             return 0
         ok, msg = set_stage_manager(False, dry_run=dry_run)
         log(f"turn OFF: {msg}")
-        if not ok:
-            # in-flight = 请求已下发、守护进程正在点，尚未有结果。
-            # 这不是失败：本轮不写任何标记，等下一轮用真实 pref 值重新判断
-            # （守护进程点完后 pref 会变 False，自然走到上面的"already off"分支）。
-            if "in-flight" not in msg:
-                return 1
-            return 0
-        if not dry_run:
+        # 下发即记账：closed_by_script 在请求发出时就落盘，不等 ok 回来。
+        # 为什么不能等：等结果的窗口（REQUEST_TIMEOUT=90s）盖不住 daemon 内部
+        # 重试叠加面板冷启动的尾部——一旦 pref 在两轮之间翻转，下一轮会走上面
+        # 的"already off"早退分支，既不收结果也不写标记，工具自己关的会被
+        # 误归属成"用户关的"，回单屏时漏恢复。提前落盘后，标记不再依赖结果
+        # 的及时回收；彻底失败时在下方回滚，残留标记也会被单屏轮的
+        # "already restored"清标记自愈。
+        # 已有旧标记时不覆盖：pref_before_close 要保留最早那次的值
+        # （用户重开过再关的场景里，恢复依据不变）。
+        wrote_marker = False
+        if not dry_run and not state.get("closed_by_script"):
             state["closed_by_script"] = True
             state["closed_at"] = datetime.now(timezone.utc).isoformat()
             state["screens_at_close"] = n
             # 记住关之前是什么，恢复时原样奉还
             state["pref_before_close"] = pf
             save_state(state)
+            wrote_marker = True
+        if not ok:
+            # in-flight = 请求已下发、守护进程正在点，尚未有结果。不是失败，
+            # 本轮写入的标记保留（这正是"下发即记账"的意义）。真失败才回滚
+            # 本轮写入的标记——没关成的东西不许挂"待恢复"（fail-safe 方向）；
+            # 早前轮次留下的旧标记不属于本轮，不得回滚。
+            if "in-flight" not in msg:
+                if wrote_marker:
+                    state.pop("closed_by_script", None)
+                    for k in ("closed_at", "screens_at_close", "pref_before_close"):
+                        state.pop(k, None)
+                    save_state(state)
+                return 1
+            return 0
         return 0
 
     # action == restore：单屏

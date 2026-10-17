@@ -63,6 +63,8 @@ def _as_list(items: list) -> str:
 POLL_INTERVAL = 1.0
 RETRY_LIMIT = 5
 RETRY_SLEEP = 2.0
+# 点击后 pref（GloballyEnabled）落后 UI 值的实测窗口 ~5s；此处给 2 倍余量
+PREF_LAG_WAIT = 10
 OPEN_WAIT = 3.0
 # 设置面板从 open 到 AX 可读的实测耗时：18–28 秒（2026-10-16 三次采样）。
 # 单次 osascript 调用本身要数秒，故轮询次数要给足；总预算约 3 + 20*2 = 43 秒。
@@ -209,6 +211,22 @@ def pref_enabled():
         return None
 
 
+def await_pref_adopted(desired: bool, wait: float = PREF_LAG_WAIT) -> bool:
+    """等 pref（GloballyEnabled）跟上 UI 值。
+
+    点击后 pref 落后 UI 约 5 秒（实测）。与其每轮烧一次 8–11 秒的 osascript
+    重试去"再确认"，不如每秒读一次便宜的 defaults 等它跟上；等待有界
+    （wait 上限），永不跟上时返回 False 交回外层重试逻辑。
+    """
+    deadline = time.time() + wait
+    while True:
+        if pref_enabled() == desired:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(1.0)
+
+
 def open_pane() -> bool:
     """打开「桌面与程序坞」并等到 UI 树真的可读。
 
@@ -349,20 +367,26 @@ def do_set(desired: bool) -> tuple[bool, str]:
             not_found_streak = 0
             if state == "ALREADY":
                 # UI 已是目标值不等于系统已采纳：实测出现过 ui=1 而 pref=False 的
-                # 短暂不一致。故这里仍要复核 pref，不一致就继续尝试而非谎报成功。
+                # 短暂不一致。故这里仍要复核 pref，不一致就先等它跟上（见
+                # await_pref_adopted），等不到才走下一轮完整重试。
                 pf = pref_enabled()
-                if pf == desired:
+                if pf == desired or await_pref_adopted(desired):
                     # 与 CLICKED 分支一样要记活动时间：否则反复处理"已是目标态"的
                     # 请求时 _LAST_ACTIVITY 停在旧值，120 秒后窗口被误关，
                     # 下一次又要 18–28 秒冷启动。
                     _LAST_ACTIVITY[0] = time.time()
                     return True, f"already {want}"
-                log(f"attempt {attempt}: ui already {want} but pref={pf} (not yet adopted)")
+                log(f"attempt {attempt}: ui already {want} but pref not adopted "
+                    f"after {PREF_LAG_WAIT}s wait")
                 time.sleep(RETRY_SLEEP)
                 continue
             # CLICKED|cur|newval —— newval 是点完读回的 UI 值
             newval = detail.split("|")[-1]
             pf_after = pref_enabled()
+            if newval == want and pf_after != desired:
+                # pref 滞后是常态（~5s）：轮询等它跟上，别急着判失败
+                if await_pref_adopted(desired):
+                    pf_after = desired
             if newval == want and pf_after == desired:
                 _LAST_ACTIVITY[0] = time.time()      # 记下活动时间，供空闲关窗
                 return True, f"set to {want} (ui={newval} pref={pf_after})"

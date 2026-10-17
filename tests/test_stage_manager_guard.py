@@ -107,6 +107,38 @@ def main() -> int:
     check(saved.get("pref_before_close") is True,
           "多屏且已关时必须保留 pref_before_close（恢复值的唯一依据）")
 
+    # 2g) 下发即记账：in-flight（守护进程正在点、本轮没结果）时，本轮下发的
+    #     标记必须已落盘。旧语义"等 ok 再写"存在漏账窗口：等结果的 90s 盖不住
+    #     daemon 重试尾部时，pref 在两轮之间翻转，下一轮走"already off"早退
+    #     分支，工具自己关的会被误归属成用户关的，回单屏时漏恢复。
+    with tempfile.TemporaryDirectory() as td:
+        mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+        mod.screen_count = lambda: 3
+        mod.pref_enabled = lambda: True
+        mod.set_stage_manager = lambda d, dry_run=False: (
+            False, "in-flight (result will be collected on next poll)")
+        rc5 = mod.run(dry_run=False)
+        saved5 = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
+    check(rc5 == 0 and saved5.get("closed_by_script") is True
+          and saved5.get("pref_before_close") is True,
+          "in-flight 时本轮下发的标记必须已落盘（防漏账归属）")
+
+    # 2h) 旧标记保护：更早轮次留下的标记在本次关闭彻底失败时不得被回滚
+    #     （回滚只许动本轮写入的；pref_before_close 是恢复值的唯一依据）
+    with tempfile.TemporaryDirectory() as td:
+        mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+        pathlib.Path(mod.STATE_PATH).write_text(
+            json.dumps({"closed_by_script": True, "pref_before_close": True}),
+            encoding="utf-8")
+        mod.screen_count = lambda: 3
+        mod.pref_enabled = lambda: True
+        mod.set_stage_manager = lambda d, dry_run=False: (False, "stub failed")
+        rc6 = mod.run(dry_run=False)
+        saved6 = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
+    check(rc6 == 1 and saved6.get("closed_by_script") is True
+          and saved6.get("pref_before_close") is True,
+          "旧标记不属于本轮，失败回滚不得误删")
+
     # 4) 计数读不到必须中止（退出码 2），不得当单屏
     with tempfile.TemporaryDirectory() as td:
         mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
@@ -192,9 +224,11 @@ def main() -> int:
     # 7) 读回校验：成功判据必须同时看 UI 与 pref（现在这条判据在 daemon 里）
     check("newval == want and pf_after == desired" in dsrc,
           "读回校验必须同时比对 UI 值与 pref 值")
-    # 7a) ALREADY 分支也必须复核 pref：UI 已是目标值 ≠ 系统已采纳
-    check("ui already" in dsrc and "not yet adopted" in dsrc,
-          "ALREADY 分支必须复核 pref，不能只看 UI 值就宣称成功")
+    # 7a) ALREADY 分支也必须复核 pref：UI 已是目标值 ≠ 系统已采纳。
+    #     （滞后场景允许 await_pref_adopted 等待后再判成功，但复核本身不可省）
+    check("pf == desired or await_pref_adopted(desired)" in dsrc
+          and "not adopted" in dsrc,
+          "ALREADY 分支必须复核 pref（含滞后等待），不能只看 UI 值就宣称成功")
     # 7b) AppleScript 变量名不得用保留字 `after`：会报
     #     "Expected expression but found 'to'"，且报错行号是假的（恒为 541）
     check("set after to" not in dsrc,
@@ -379,6 +413,27 @@ def main() -> int:
     # 翻译器必须真接在 osa() 出错路径上（防"只定义不调用"的真空实现）
     check("ax_deny_hint(" in dsrc and "_AX_HINTED[0] = True" in dsrc,
           "osa() 出错路径必须实际调用 ax_deny_hint() 且带一次性去重")
+
+    # 10) pref 滞后等待：点击后 pref 落后 UI ~5s（实测）。await_pref_adopted 用
+    #     便宜的 defaults 轮询等它跟上，而不是每轮烧 8–11s 的 osascript 重试
+    orig_pref = sd.pref_enabled
+    seq = [False, False, True]
+    sd.pref_enabled = lambda: seq.pop(0) if seq else True
+    ok_p = sd.await_pref_adopted(True, wait=5)
+    sd.pref_enabled = orig_pref
+    check(ok_p is True, "pref 跟上后 await_pref_adopted 必须返回 True")
+    sd.pref_enabled = lambda: False
+    _t0 = time.time()
+    ok_q = sd.await_pref_adopted(True, wait=1.5)
+    _el = time.time() - _t0
+    sd.pref_enabled = orig_pref
+    check(ok_q is False and 1.0 <= _el <= 3.5,
+          "永不跟上时必须在 wait 窗口内有界退出（有界性）")
+    check(getattr(sd, "PREF_LAG_WAIT", 0) >= 8,
+          "PREF_LAG_WAIT 必须覆盖实测 ~5s 的 pref 滞后并留余量")
+    # 两个滞后分支都必须真的调用它（防"只定义不调用"）
+    check(dsrc.count("await_pref_adopted(") >= 3,
+          "ALREADY 与 CLICKED 两个滞后分支必须实际调用 await_pref_adopted")
 
     failed = [m for ok, m in results if not ok]
     for ok, m in results:
