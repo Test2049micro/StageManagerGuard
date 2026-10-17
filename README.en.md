@@ -103,6 +103,11 @@ same hint in its log.
   are welcome.
 - The System Settings window appears briefly while clicking (auto-closes after
   2 minutes idle).
+- **If you flip the toggle manually while the tool is mid-click**: the tool follows
+  its contract (off on multi-display / restore to the pre-close value on
+  single-display), so a manual change made during the in-flight round may be
+  overridden by that round. Manual changes made **after** a round completes are
+  never touched.
 - **Where the 34–40 seconds come from** (all measured, not estimated):
   1. Settings pane cold start ~16 s (only when the window was previously closed);
   2. Each `osascript` call ~8–11 s (AppleEvent connection overhead, unavoidable);
