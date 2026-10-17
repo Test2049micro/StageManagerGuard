@@ -70,7 +70,10 @@ REQUEST_STALE_AFTER = 180              # inflight 请求超过此时长未完成
 # subprocess.run 的 wait 永久阻塞、子进程已消失但父进程等不到——__semwait_signal）
 # 都会让轮询停摆数小时。用 alarm 强制收尾，宁可本轮不做事也不能卡死。
 _WARNED_NO_PROBE = False   # 未 build 的提示只打一次
-ROUND_BUDGET = 150   # 必须 > REQUEST_TIMEOUT + 探测余量，否则 alarm 会砍断正常的结果等待
+# 必须 > 探测最坏耗时 + REQUEST_TIMEOUT：两个探测各最坏 2×15+1=31s（共 62s），
+# 结果等待再吃满 90s = 152s；预算若只有 150s，alarm 会在结果等待中途砍轮，
+# 把"标记已落盘、结果还没回"的轮次整个丢掉（评审席 P1-1 的算术）。
+ROUND_BUDGET = 200
 
 
 class _RoundTimeout(Exception):
@@ -181,15 +184,18 @@ def load_state() -> dict:
         return {}
 
 
-def save_state(state: dict) -> None:
+def save_state(state: dict) -> bool:
+    """落盘状态。返回是否成功——调用方据此决定"账本写不进去就不许派发"。"""
     try:
         os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
         tmp = STATE_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         os.replace(tmp, STATE_PATH)
+        return True
     except OSError as e:
         log(f"save_state failed: {e}")
+        return False
 
 
 # ---------- 请求下发（执行权在 sm_daemon.py，见其文件头说明） ----------
@@ -199,24 +205,33 @@ REQ_PATH = os.path.join(REQ_DIR, "request.json")
 INFLIGHT_PATH = os.path.join(REQ_DIR, "request.inflight")
 RESULT_PATH = os.path.join(REQ_DIR, "result.json")
 _SEQ_COUNTER: int | None = None   # 进程内 seq 兜底（time_ns 粒度不足时会重复）
+# 最近一次被采信结果对应的请求 seq。跨轮回滚的依据：标记记着自己是由哪条请求
+# 记的账（closed_by_seq），结果失败时只有 seq 对得上才回滚——
+# 评审席 P1-2：只看"本轮是否写过"盖不住「上轮 in-flight 落账、这轮才收到失败」。
+_LAST_RESULT_SEQ: int | None = None
 
 
-def write_request(action: str, restore_to: bool = False) -> None:
+def write_request(action: str, restore_to: bool = False, seq: int | None = None) -> int:
     """写一个待办请求给守护进程。原子写入，避免守护进程读到半截 JSON。
 
     seq 单调递增：守护进程据此丢弃过期请求，防止"连写两个请求时旧的覆盖新意图"。
+    seq 可由调用方传入（guard 先记账后派发时，要用同一个 seq 把标记与请求绑定，
+    评审席 P1-2：跨轮回滚要靠"标记记着是哪条请求给的账"）。
     """
     os.makedirs(REQ_DIR, exist_ok=True)
+    if seq is None:
+        seq = _next_seq()
     payload = {
         "action": action,
         "restore_to": restore_to,
         "at": datetime.now(timezone.utc).isoformat(),
-        "seq": _next_seq(),
+        "seq": seq,
     }
     tmp = REQ_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, REQ_PATH)
+    return seq
 
 
 def _next_seq() -> int:
@@ -254,6 +269,7 @@ def wait_result(start_ts: float, timeout: float | None = 0) -> tuple[bool, str]:
         return False, "in-flight (result will be collected on next poll)"
 
     deadline = start_ts + max(timeout, 0)
+    global _LAST_RESULT_SEQ
     while True:
         try:
             with open(RESULT_PATH, encoding="utf-8") as f:
@@ -261,6 +277,7 @@ def wait_result(start_ts: float, timeout: float | None = 0) -> tuple[bool, str]:
             at = r.get("at")
             # 严格大于请求发起时刻：同一秒内写回的旧结果不予采信
             if at and _iso_ts(at) > start_ts:
+                _LAST_RESULT_SEQ = r.get("seq")
                 return bool(r.get("ok")), str(r.get("msg", ""))
         except Exception:
             pass
@@ -316,11 +333,13 @@ def _reclaim_stale_inflight(pending: dict) -> bool:
     return True
 
 
-def set_stage_manager(desired: bool, dry_run: bool = False) -> tuple[bool, str]:
+def set_stage_manager(desired: bool, dry_run: bool = False,
+                      seq: int | None = None) -> tuple[bool, str]:
     """请求把台前调度设为 desired。
 
     本进程（launchd）没有辅助功能权限，点不了开关，只能下发请求；
     真正的点击由用户会话里的 sm_daemon.py 完成，成败以它写回的 result.json 为准。
+    seq 由调用方传入时，与已落盘的标记绑定（见 _run_inner off 分支）。
     """
     if dry_run:
         return True, f"dry-run: would request enabled={desired}"
@@ -333,11 +352,18 @@ def set_stage_manager(desired: bool, dry_run: bool = False) -> tuple[bool, str]:
         if _reclaim_stale_inflight(pending):
             pending = None                     # 已回收，本轮重新下发
         else:
-            log(f"request already pending (seq={pending.get('seq')}); waiting for its result")
+            my_action = "restore" if desired else "off"
             started = _iso_ts(pending.get("at", "")) or time.time()
             # 上一轮（或本进程早前）已下发但未收：等到它的预算耗尽为止，
-            # 保证 result 一定被某一轮收走并落盘 closed_by_script。
+            # 保证 result 一定被某一轮收走并落盘。
             budget = max(0.0, started + REQUEST_TIMEOUT - time.time())
+            if pending.get("action") != my_action:
+                # 对向动作尚未收尾：等它落地，但绝不把它的结果记到本轮头上——
+                # 否则单屏恢复会把"off 成功"误当"恢复成功"，反之亦然
+                # （评审席 P1-3 的姊妹路径）。下一轮按真实 pref 重新决策。
+                wait_result(started, timeout=budget)
+                return False, "in-flight (opposite action pending)"
+            log(f"request already pending (seq={pending.get('seq')}); waiting for its result")
             return wait_result(started, timeout=budget)
 
     # 先清掉上一轮结果，避免把旧结果当成本轮成败
@@ -346,8 +372,9 @@ def set_stage_manager(desired: bool, dry_run: bool = False) -> tuple[bool, str]:
     except OSError:
         pass
     started = time.time()
-    write_request("restore" if desired else "off", restore_to=desired)
-    log(f"request written: action={'restore' if desired else 'off'} desired={desired}")
+    seq = write_request("restore" if desired else "off", restore_to=desired, seq=seq)
+    log(f"request written: action={'restore' if desired else 'off'} "
+        f"desired={desired} seq={seq}")
     # 阻塞等结果：launchd 的 StartInterval 对同一 job 天然串行（上一轮没退出
     # 不会起新实例），所以阻塞不会丢轮；而"下发就走、下轮再收"曾导致
     # closed_by_script 永远无人收集（下轮 pref 已翻转，走 already off 分支跳过收集），
@@ -402,35 +429,42 @@ def _run_inner(dry_run: bool = False) -> int:
             else:
                 log("already off (turned off by user); nothing to do")
             return 0
-        ok, msg = set_stage_manager(False, dry_run=dry_run)
-        log(f"turn OFF: {msg}")
-        # 下发即记账：closed_by_script 在请求发出时就落盘，不等 ok 回来。
-        # 为什么不能等：等结果的窗口（REQUEST_TIMEOUT=90s）盖不住 daemon 内部
-        # 重试叠加面板冷启动的尾部——一旦 pref 在两轮之间翻转，下一轮会走上面
-        # 的"already off"早退分支，既不收结果也不写标记，工具自己关的会被
-        # 误归属成"用户关的"，回单屏时漏恢复。提前落盘后，标记不再依赖结果
-        # 的及时回收；彻底失败时在下方回滚，残留标记也会被单屏轮的
-        # "already restored"清标记自愈。
-        # 已有旧标记时不覆盖：pref_before_close 要保留最早那次的值
-        # （用户重开过再关的场景里，恢复依据不变）。
-        wrote_marker = False
+        # 下发即记账：标记（连同本周期请求的 seq）在请求发出**之前**落盘。
+        # 为什么必须写在派发之前而不是"调用返回之后"：等结果的窗口会被 alarm
+        # 截断（探测最坏 62s + 等待 90s 曾把预算顶到 152>150），截断路径下
+        # "返回之后再写"永远轮不到执行——工具自己关的会被误归属成用户关的
+        # （评审席 P1-1）。closed_by_seq 把标记与具体那条请求绑定，结果失败时
+        # 按 seq 回滚，跨轮也成立（评审席 P1-2）；seq 对不上的旧标记属于更早
+        # 的周期，不误删。已有旧标记时不覆盖：pref_before_close 保留最早值。
+        seq = None
         if not dry_run and not state.get("closed_by_script"):
+            seq = _next_seq()
             state["closed_by_script"] = True
             state["closed_at"] = datetime.now(timezone.utc).isoformat()
             state["screens_at_close"] = n
             # 记住关之前是什么，恢复时原样奉还
             state["pref_before_close"] = pf
-            save_state(state)
-            wrote_marker = True
+            state["closed_by_seq"] = seq
+            if not save_state(state):
+                # 账本写不进去就不许派发：恢复依据落不了盘，宁可这轮不动 GUI
+                log("cannot persist close marker; refusing to dispatch (fail-safe)")
+                return 2
+        ok, msg = set_stage_manager(False, dry_run=dry_run, seq=seq)
+        log(f"turn OFF: {msg}")
         if not ok:
-            # in-flight = 请求已下发、守护进程正在点，尚未有结果。不是失败，
-            # 本轮写入的标记保留（这正是"下发即记账"的意义）。真失败才回滚
-            # 本轮写入的标记——没关成的东西不许挂"待恢复"（fail-safe 方向）；
-            # 早前轮次留下的旧标记不属于本轮，不得回滚。
+            # in-flight：请求已下发、守护进程正在点，尚未有结果。不是失败，
+            # 标记保留（这正是"下发即记账"的意义）。
             if "in-flight" not in msg:
-                if wrote_marker:
+                # 真失败：只有当失败结果正是"给这个标记记账的那条请求"时才回滚
+                # ——没关成的东西不许挂"待恢复"（fail-safe 方向）。比对的是
+                # 账本里的 closed_by_seq，不是"本轮是否派发过"：标记常是更早
+                # 轮次落的账、结果这轮才收到（评审席 P1-2 的原始场景）。
+                if (not dry_run
+                        and state.get("closed_by_seq") is not None
+                        and state.get("closed_by_seq") == _LAST_RESULT_SEQ):
                     state.pop("closed_by_script", None)
-                    for k in ("closed_at", "screens_at_close", "pref_before_close"):
+                    for k in ("closed_at", "screens_at_close", "pref_before_close",
+                              "closed_by_seq"):
                         state.pop(k, None)
                     save_state(state)
                 return 1
@@ -444,8 +478,16 @@ def _run_inner(dry_run: bool = False) -> int:
     prev = state.get("pref_before_close")
     want = bool(prev) if isinstance(prev, bool) else False
     if pf is want:
+        if _pending_request() is not None:
+            # 还有请求没收尾（典型：插屏瞬间的 off 请求仍在点击队列里）。
+            # 此刻清标记，等 daemon 把 off 点成 pf=False 后，就没有任何账本
+            # 记得"该恢复成 True"了——单屏停留在关态且无人负责（评审席 P1-3）。
+            # 延后清账，下一轮按真实 pref 重新决策。
+            log("pending request still in flight; deferring marker clear")
+            return 0
         log(f"already restored (pref={pf}); clearing flag")
         state.pop("closed_by_script", None)
+        state.pop("closed_by_seq", None)
         state["restored_at"] = datetime.now(timezone.utc).isoformat()
         save_state(state)
         return 0
@@ -458,6 +500,7 @@ def _run_inner(dry_run: bool = False) -> int:
         return 0
     if not dry_run:
         state.pop("closed_by_script", None)
+        state.pop("closed_by_seq", None)
         state["restored_at"] = datetime.now(timezone.utc).isoformat()
         state["screens_at_restore"] = n
         save_state(state)

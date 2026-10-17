@@ -54,6 +54,12 @@ def main() -> int:
     def run_with_state(state_obj: dict, screens: int, pref: bool | None):
         with tempfile.TemporaryDirectory() as td:
             mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+            # 请求/结果文件也必须隔离：guard 会真写 request.json，
+            # 不隔离的话测试请求会喂给本机现役 daemon，真的去点开关
+            mod.REQ_DIR = td
+            mod.REQ_PATH = str(pathlib.Path(td) / "request.json")
+            mod.INFLIGHT_PATH = str(pathlib.Path(td) / "request.inflight")
+            mod.RESULT_PATH = str(pathlib.Path(td) / "result.json")
             if state_obj is not None:
                 pathlib.Path(mod.STATE_PATH).write_text(
                     json.dumps(state_obj), encoding="utf-8")
@@ -61,7 +67,7 @@ def main() -> int:
             mod.screen_count = lambda: screens
             mod.pref_enabled = lambda: pref
             calls: list[bool] = []
-            mod.set_stage_manager = lambda desired, dry_run=False: (
+            mod.set_stage_manager = lambda desired, dry_run=False, seq=None: (
                 calls.append(desired) or (True, "stub"))
             rc = mod.run(dry_run=False)
             saved = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8")) \
@@ -107,44 +113,114 @@ def main() -> int:
     check(saved.get("pref_before_close") is True,
           "多屏且已关时必须保留 pref_before_close（恢复值的唯一依据）")
 
-    # 2g) 下发即记账：in-flight（守护进程正在点、本轮没结果）时，本轮下发的
-    #     标记必须已落盘。旧语义"等 ok 再写"存在漏账窗口：等结果的 90s 盖不住
-    #     daemon 重试尾部时，pref 在两轮之间翻转，下一轮走"already off"早退
-    #     分支，工具自己关的会被误归属成用户关的，回单屏时漏恢复。
+    # 2g) 下发即记账（在调用执行期间观察）：标记必须先于请求落盘。只在返回后
+    #     检查文件是骗得过/骗不过都说明不了的弱断言——打桩在函数体内读账本，
+    #     alarm 截断等结果等待的路径（评审席 P1-1）也覆盖不到这条之外。
     with tempfile.TemporaryDirectory() as td:
         mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+        mod.REQ_DIR = td
+        mod.REQ_PATH = str(pathlib.Path(td) / "request.json")
+        mod.INFLIGHT_PATH = str(pathlib.Path(td) / "request.inflight")
+        mod.RESULT_PATH = str(pathlib.Path(td) / "result.json")
         mod.screen_count = lambda: 3
         mod.pref_enabled = lambda: True
-        mod.set_stage_manager = lambda d, dry_run=False: (
-            False, "in-flight (result will be collected on next poll)")
+        seen: dict = {}
+
+        def observing_stub(desired, dry_run=False, seq=None):
+            st = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
+            seen["during"] = st.get("closed_by_script")
+            seen["seq_bound"] = st.get("closed_by_seq") == seq
+            return (False, "in-flight (result will be collected on next poll)")
+
+        mod.set_stage_manager = observing_stub
         rc5 = mod.run(dry_run=False)
         saved5 = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
-    check(rc5 == 0 and saved5.get("closed_by_script") is True
-          and saved5.get("pref_before_close") is True,
-          "in-flight 时本轮下发的标记必须已落盘（防漏账归属）")
+    check(rc5 == 0 and seen.get("during") is True and seen.get("seq_bound") is True
+          and saved5.get("closed_by_script") is True,
+          "标记必须先于请求落盘、在调用体内已可观察且与请求 seq 绑定")
 
-    # 2h) 旧标记保护：更早轮次留下的标记在本次关闭彻底失败时不得被回滚
-    #     （回滚只许动本轮写入的；pref_before_close 是恢复值的唯一依据）
+    # 2h) 旧标记保护：旧标记的 seq 与本轮失败结果的 seq 对不上 → 不回滚；
+    #     且旧 pref_before_close 不得被本轮 pf 覆盖（特意 False/True 错开，
+    #     抓"错误覆盖恢复值"——两边同值时该缺陷不可见）
     with tempfile.TemporaryDirectory() as td:
         mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
-        pathlib.Path(mod.STATE_PATH).write_text(
-            json.dumps({"closed_by_script": True, "pref_before_close": True}),
-            encoding="utf-8")
+        mod.REQ_DIR = td
+        mod.REQ_PATH = str(pathlib.Path(td) / "request.json")
+        mod.INFLIGHT_PATH = str(pathlib.Path(td) / "request.inflight")
+        mod.RESULT_PATH = str(pathlib.Path(td) / "result.json")
+        pathlib.Path(mod.STATE_PATH).write_text(json.dumps(
+            {"closed_by_script": True, "pref_before_close": False,
+             "closed_by_seq": 777}), encoding="utf-8")
         mod.screen_count = lambda: 3
         mod.pref_enabled = lambda: True
-        mod.set_stage_manager = lambda d, dry_run=False: (False, "stub failed")
+        mod._LAST_RESULT_SEQ = 888          # 失败结果不是给旧标记记账的那条
+        mod.set_stage_manager = lambda desired, dry_run=False, seq=None: (
+            False, "failed after 5 attempts")
         rc6 = mod.run(dry_run=False)
         saved6 = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
     check(rc6 == 1 and saved6.get("closed_by_script") is True
-          and saved6.get("pref_before_close") is True,
-          "旧标记不属于本轮，失败回滚不得误删")
+          and saved6.get("pref_before_close") is False,
+          "旧标记 seq 不匹配时不回滚，且 pref_before_close 不被本轮覆盖")
+
+    # 2i) 跨轮精确回滚：标记是更早轮次落的账，但失败结果正是给它记账的那条
+    #     请求（seq 对上）→ 必须回滚。只看"本轮是否写过"盖不住这条（评审席 P1-2）
+    with tempfile.TemporaryDirectory() as td:
+        mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+        mod.REQ_DIR = td
+        mod.REQ_PATH = str(pathlib.Path(td) / "request.json")
+        mod.INFLIGHT_PATH = str(pathlib.Path(td) / "request.inflight")
+        mod.RESULT_PATH = str(pathlib.Path(td) / "result.json")
+        pathlib.Path(mod.STATE_PATH).write_text(json.dumps(
+            {"closed_by_script": True, "pref_before_close": True,
+             "closed_by_seq": 555}), encoding="utf-8")
+        mod.screen_count = lambda: 3
+        mod.pref_enabled = lambda: True
+        mod._LAST_RESULT_SEQ = 555          # 失败结果正是给标记记账的那条请求
+        mod.set_stage_manager = lambda desired, dry_run=False, seq=None: (
+            False, "failed after 5 attempts")
+        rc7 = mod.run(dry_run=False)
+        saved7 = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
+    check(rc7 == 1 and "closed_by_script" not in saved7
+          and "pref_before_close" not in saved7
+          and "closed_by_seq" not in saved7,
+          "失败结果 seq 与标记记账 seq 对上时必须跨轮回滚")
+
+    # 2j) restore 分支 pending 门闩：pf 已等于恢复目标但还有请求没收尾
+    #     （插屏瞬间的 off 仍在点击队列）→ 不得清标记，否则 off 点成之后
+    #     单屏停留在关态且无人负责（评审席 P1-3）
+    def run_pending_gate(pending_req):
+        with tempfile.TemporaryDirectory() as td:
+            mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+            mod.REQ_DIR = td
+            mod.REQ_PATH = str(pathlib.Path(td) / "request.json")
+            mod.INFLIGHT_PATH = str(pathlib.Path(td) / "request.inflight")
+            mod.RESULT_PATH = str(pathlib.Path(td) / "result.json")
+            pathlib.Path(mod.STATE_PATH).write_text(json.dumps(
+                {"closed_by_script": True, "pref_before_close": True,
+                 "closed_by_seq": 1}), encoding="utf-8")
+            mod.screen_count = lambda: 1
+            mod.pref_enabled = lambda: True
+            mod._pending_request = (lambda: pending_req) if pending_req \
+                else lambda: None
+            mod.set_stage_manager = lambda desired, dry_run=False, seq=None: (
+                (_ for _ in ()).throw(AssertionError("此路径不得派发请求")))
+            rc = mod.run(dry_run=False)
+            saved = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
+            return rc, saved
+
+    rc8, saved8 = run_pending_gate({"action": "off", "seq": 1})
+    check(rc8 == 0 and saved8.get("closed_by_script") is True,
+          "pending 未收尾时不得清标记（延后清账）")
+    rc9, saved9 = run_pending_gate(None)
+    check(rc9 == 0 and "closed_by_script" not in saved9,
+          "无 pending 时 pf 已达标照常清标记（自愈路径仍在）")
 
     # 4) 计数读不到必须中止（退出码 2），不得当单屏
     with tempfile.TemporaryDirectory() as td:
         mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
         mod.screen_count = lambda: None          # 探测失败
         mod.pref_enabled = lambda: False
-        mod.set_stage_manager = lambda d, dry_run=False: (_ for _ in ()).throw(
+        mod.set_stage_manager = lambda d, dry_run=False, seq=None: (_ for _ in ()).throw(
             AssertionError("探测失败时绝不允许动 GUI"))
         rc2 = mod.run(dry_run=False)
     check(rc2 == 2, f"计数读不到必须返回 2，实际={rc2}")
@@ -154,23 +230,57 @@ def main() -> int:
         mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
         mod.screen_count = lambda: 3
         mod.pref_enabled = lambda: None
-        mod.set_stage_manager = lambda d, dry_run=False: (_ for _ in ()).throw(
+        mod.set_stage_manager = lambda d, dry_run=False, seq=None: (_ for _ in ()).throw(
             AssertionError("状态未知时绝不允许动 GUI"))
         rc3 = mod.run(dry_run=False)
     check(rc3 == 2, f"当前状态读不到必须返回 2，实际={rc3}")
 
-    # 4c) 打桩 set_stage_manager 返回失败时必须返回非 0（不许谎报成功）
+    # 4c) 关闭彻底失败必须返回非 0（不许谎报成功），且标记按 seq 回滚——
+    #     失败结果正是给标记记账的那条请求，走真实对账路径（读 seq 再失败）
     with tempfile.TemporaryDirectory() as td:
         mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+        mod.REQ_DIR = td
+        mod.REQ_PATH = str(pathlib.Path(td) / "request.json")
+        mod.INFLIGHT_PATH = str(pathlib.Path(td) / "request.inflight")
+        mod.RESULT_PATH = str(pathlib.Path(td) / "result.json")
         mod.screen_count = lambda: 3
         mod.pref_enabled = lambda: True
-        mod.set_stage_manager = lambda d, dry_run=False: (False, "stub failed")
+
+        def failing_stub(desired, dry_run=False, seq=None):
+            st = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8"))
+            mod._LAST_RESULT_SEQ = st.get("closed_by_seq")
+            return (False, "failed after 5 attempts")
+
+        mod.set_stage_manager = failing_stub
         rc4 = mod.run(dry_run=False)
         saved4 = json.loads(pathlib.Path(mod.STATE_PATH).read_text(encoding="utf-8")) \
             if pathlib.Path(mod.STATE_PATH).exists() else {}
     check(rc4 == 1, f"关闭失败必须返回 1，实际={rc4}")
     check(not saved4.get("closed_by_script"),
-          "关闭失败时不得置 closed_by_script（否则单屏时会去恢复一个没关成的状态）")
+          "关闭失败时不得留 closed_by_script（否则单屏时会去恢复一个没关成的状态）")
+
+    # 4d) 账本写不进去就不许派发：save_state 失败时宁可这轮不动 GUI，
+    #     也绝不留下"没有恢复依据的关闭"（评审席 P2-6 的保守解）
+    with tempfile.TemporaryDirectory() as td:
+        mod.STATE_PATH = str(pathlib.Path(td) / "state.json")
+        mod.REQ_DIR = td
+        mod.REQ_PATH = str(pathlib.Path(td) / "request.json")
+        mod.INFLIGHT_PATH = str(pathlib.Path(td) / "request.inflight")
+        mod.RESULT_PATH = str(pathlib.Path(td) / "result.json")
+        mod.screen_count = lambda: 3
+        mod.pref_enabled = lambda: True
+        orig_save = mod.save_state
+        mod.save_state = lambda st: False
+
+        def must_not_dispatch(desired, dry_run=False, seq=None):
+            raise AssertionError("账本写不进去时绝不允许派发关闭请求")
+
+        mod.set_stage_manager = must_not_dispatch
+        rc10 = mod.run(dry_run=False)
+        mod.save_state = orig_save
+        req_left = pathlib.Path(mod.REQ_PATH).exists()
+    check(rc10 == 2 and not req_left,
+          f"save_state 失败必须拒派发并返回 2（实际 rc={rc10}，req 存在={req_left}）")
 
     # 5) 实测结论必须留在注释里（防后人改回 defaults write，或改成自己点 GUI）
     check("defaults write" in src and "不生效" in src,
@@ -303,9 +413,13 @@ def main() -> int:
     #     （下轮 pref 已翻转走 already-off 分支跳过收集）→ 单屏恢复静默失效
     check("timeout=REQUEST_TIMEOUT" in src,
           "set_stage_manager 必须阻塞等回结果（timeout=REQUEST_TIMEOUT），不得下发就走")
-    # 8j) 单轮预算必须大于请求超时，否则 alarm 砍断正常的结果等待
-    check(mod.ROUND_BUDGET > mod.REQUEST_TIMEOUT,
-          f"ROUND_BUDGET({mod.ROUND_BUDGET}) 必须 > REQUEST_TIMEOUT({mod.REQUEST_TIMEOUT})")
+    # 8j) 单轮预算必须大于"探测最坏耗时 + 请求超时"：两个探测各最坏
+    #     2×15+1=31s，只比 REQUEST_TIMEOUT 会在结果等待中途被 alarm 砍轮
+    #     （评审席 P1-1 的算术：62+90=152 曾 > ROUND_BUDGET 150）
+    check(mod.ROUND_BUDGET > mod.REQUEST_TIMEOUT
+          + 2 * (mod.PROBE_TIMEOUT * mod.PROBE_ATTEMPTS + mod.PROBE_RETRY_SLEEP),
+          f"ROUND_BUDGET({mod.ROUND_BUDGET}) 必须 > REQUEST_TIMEOUT + 探测最坏耗时"
+          f"({mod.REQUEST_TIMEOUT + 2 * (mod.PROBE_TIMEOUT * mod.PROBE_ATTEMPTS + mod.PROBE_RETRY_SLEEP)})")
 
     # 8k) 状态文件损坏必须留档 + 不静默吞掉（真行为验证，非字符串检查）。
     #     状态文件是"该恢复成什么"的唯一依据；静默当空会导致：
@@ -429,8 +543,8 @@ def main() -> int:
     sd.pref_enabled = orig_pref
     check(ok_q is False and 1.0 <= _el <= 3.5,
           "永不跟上时必须在 wait 窗口内有界退出（有界性）")
-    check(getattr(sd, "PREF_LAG_WAIT", 0) >= 8,
-          "PREF_LAG_WAIT 必须覆盖实测 ~5s 的 pref 滞后并留余量")
+    check(8 <= getattr(sd, "PREF_LAG_WAIT", 0) <= 30,
+          "PREF_LAG_WAIT 必须 ≥8（覆盖实测 ~5s 滞后+余量）且 ≤30（封顶重试尾长）")
     # 两个滞后分支都必须真的调用它（防"只定义不调用"）
     check(dsrc.count("await_pref_adopted(") >= 3,
           "ALREADY 与 CLICKED 两个滞后分支必须实际调用 await_pref_adopted")

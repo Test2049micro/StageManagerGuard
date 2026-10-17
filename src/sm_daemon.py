@@ -220,10 +220,12 @@ def await_pref_adopted(desired: bool, wait: float = PREF_LAG_WAIT) -> bool:
     """
     deadline = time.time() + wait
     while True:
-        if pref_enabled() == desired:
-            return True
+        # 先查截止再读：defaults 读本身可能慢（超时上限 15s），后查会让 wait
+        # 形同虚设（评审席 P2-4）。最坏只多一次读，外层重试兜底。
         if time.time() >= deadline:
             return False
+        if pref_enabled() == desired:
+            return True
         time.sleep(1.0)
 
 
@@ -416,6 +418,7 @@ def write_result(ok: bool, msg: str, req: dict) -> None:
             "ok": ok,
             "msg": msg,
             "requested": req.get("action"),
+            "seq": req.get("seq"),
             "at": datetime.now(timezone.utc).isoformat(),
         }
         tmp = RESULT_PATH + ".tmp"
