@@ -18,3 +18,6 @@ jobs:
       - name: Regression tests
         # CI 无 GUI 会话：测试全部走桩与静态断言，不碰真实开关
         run: python3 -u tests/test_stage_manager_guard.py
+      - name: Adversarial tests
+        # 对抗套件：敌意文件/类型/时序下守卫的底线（I1 不动 GUI / I2 结果不翻账 / I3 不静默错账）
+        run: python3 -u tests/test_adversarial.py
