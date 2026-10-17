@@ -155,6 +155,10 @@ def screen_count() -> int | None:
     驱动一次错误的"恢复"——这里必须把 bool 挡掉（红队 #13）。
     """
     d = run_probe("screens")
+    if not isinstance(d, dict):
+        # 探测进程输出非对象（数组/字符串）：.get 会 AttributeError 裸穿
+        # run()（不变式审计 #2-1），按读不到处理
+        return None
     n = d.get("screens")
     if isinstance(n, bool) or not isinstance(n, int):
         return None
@@ -163,6 +167,8 @@ def screen_count() -> int | None:
 
 def pref_enabled() -> bool | None:
     d = run_probe("pref")
+    if not isinstance(d, dict):
+        return None                     # 探测输出非对象：按读不到处理
     v = d.get("enabled")
     return bool(v) if isinstance(v, bool) else None
 
@@ -493,8 +499,10 @@ def _run_inner(dry_run: bool = False) -> int:
         log("ABORT: cannot determine screen count (probe failed) — refusing to guess")
         return 2
     pf = pref_enabled()
-    if pf is None:
-        # 台前调度当前状态未知时不动 GUI：可能把它从用户想要的态切走
+    if not isinstance(pf, bool):
+        # 台前调度当前状态未知时不动 GUI：可能把它从用户想要的态切走。
+        # 非 bool（"true"/1 等弱类型）同样拒收——is 比较会双双落空，
+        # 让不可信值直接驱动派发（对抗·fuzz 层 I1）
         log("ABORT: cannot read current Stage Manager state (pref probe failed) — refusing to toggle")
         return 2
     action = decide(n)
@@ -627,7 +635,15 @@ def _run_inner(dry_run: bool = False) -> int:
             log("cannot persist marker clear; reporting failure (no false success)")
             return 2
         return 0
-    ok, msg = set_stage_manager(want, dry_run=dry_run)
+    try:
+        ok, msg = set_stage_manager(want, dry_run=dry_run)
+    except _RoundTimeout:
+        raise    # alarm 砍在结果等待上：请求已出门，标记必须保留
+    except Exception as e:
+        # 与 off 分支对称的派发异常防护（fuzz 层 #107）：restore 本身没有
+        # 新落的账要回滚，标记保留（它仍是合法依据），本轮按失败收场
+        log(f"restore dispatch failed ({type(e).__name__}); marker kept")
+        return 2
     log(f"restore to {want}: {msg}")
     if not ok:
         # in-flight：守护进程正在点，本轮不清标记、不报失败，下一轮用真实 pref 判断

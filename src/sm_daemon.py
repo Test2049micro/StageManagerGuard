@@ -431,21 +431,26 @@ def write_result(ok: bool, msg: str, req: dict) -> None:
 
 
 def load_last_seq():
+    """读水位。非法值（被敌意文件毒化成巨数等）直接当无水位自愈——
+    否则一次毒化会让所有后续请求被永久跳过（fuzz 层 I5c 实测）。"""
     try:
         with open(SEQ_PATH, encoding="utf-8") as f:
-            return json.load(f).get("seq")
+            seq = json.load(f).get("seq")
     except Exception:
         return None
+    return seq if _valid_seq(seq) else None
 
 
 # 正常 seq = time_ns 量级（~1.8e18），永远小于 2^63。超过它的必是伪造：
 # 落进水位会让所有后续正常请求被永久跳过（红队 #2 的巨数毒化）
-SEQ_MAX = (1 << 63) - 1
+# 正常 seq = time_ns 量级（~1.8e18），上界留 ~70 年余量。2^63-1 太宽——
+# 2^62 就足以饿死一切正常请求（fuzz 层 I5c 实测），故收紧到 time_ns 尺度
+SEQ_MAX = 4_000_000_000_000_000_000
 
 
 def _valid_seq(v) -> bool:
     """请求 seq 必须是严格的正整数：bool（True==1）、浮点（7.0==7）、
-    负数/零、超过 2^63 的巨数一律拒收（红队 #2/#14）。"""
+    负数/零、超过上界的巨数一律拒收（红队 #2/#14）。"""
     return isinstance(v, int) and not isinstance(v, bool) and 0 < v <= SEQ_MAX
 
 
@@ -532,7 +537,14 @@ def process_once() -> bool:
     # "false" 不得驱动一次反向操作（红队 #1 的 daemon 侧防线）
     desired = (action == "restore") and req.get("restore_to") is True
     log(f"handling request seq={seq} action={action} desired_enabled={desired}")
-    ok, msg = do_set_guarded(desired)
+    # 执行端任何异常（do_set_guarded 内部的子进程错误等）都不得让 inflight
+    # 残留——残留会让 guard 的 pending 判定永远看到一笔假待办（不变式审计
+    # #2-6）。异常如实记为失败结果。
+    try:
+        ok, msg = do_set_guarded(desired)
+    except Exception as e:      # noqa: BLE001 —— 执行层兜底，失败如实上报
+        log(f"do_set_guarded raised ({type(e).__name__}); reporting failure")
+        ok, msg = False, f"executor error: {type(e).__name__}"
     log(f"request {action} -> ok={ok} {msg}")
     save_last_seq(seq)
     write_result(ok, msg, req)
