@@ -27,3 +27,9 @@ jobs:
           python3 -u tests/test_fuzz.py 20261017
           python3 -u tests/test_fuzz.py 1
           python3 -u tests/test_fuzz.py 42
+      - name: Chaos (real two-process)
+        # 真进程并发混沌：guard 轮询 + daemon 主循环 + 随机毁文件/杀进程
+        # 只断言安全性质（不赌时序），时长固定
+        run: |
+          python3 -u tests/test_chaos.py 20261017 10
+          python3 -u tests/test_chaos.py 7 10
