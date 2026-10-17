@@ -286,12 +286,18 @@ def main() -> int:
 
     # E4 旧 request.json 过期回收不得连带删掉新鲜 inflight（红队 #7）。
     #     走真实 set_stage_manager：旧 REQ(seq6, at=2000) 被 stale 回收，
-    #     新鲜 INFLIGHT(seq7) 必须原地存活
-    rc, saved, calls, req_left, infl_left = hostile_round(
-        None, screens=3, pref=True, use_real=True,
-        request_raw=json.dumps({"action": "off", "seq": 6,
-                                "at": "2000-01-01T00:00:00+00:00"}),
-        inflight_raw=json.dumps({"action": "off", "seq": 7, "at": fresh_at}))
+    #     新鲜 INFLIGHT(seq7) 必须原地存活。局部收紧 REQUEST_TIMEOUT，
+    #     否则真实路径会全额等 90s 的结果超时（CI 拖慢的主因）
+    _orig_timeout = mod.REQUEST_TIMEOUT
+    mod.REQUEST_TIMEOUT = 2
+    try:
+        rc, saved, calls, req_left, infl_left = hostile_round(
+            None, screens=3, pref=True, use_real=True,
+            request_raw=json.dumps({"action": "off", "seq": 6,
+                                    "at": "2000-01-01T00:00:00+00:00"}),
+            inflight_raw=json.dumps({"action": "off", "seq": 7, "at": fresh_at}))
+    finally:
+        mod.REQUEST_TIMEOUT = _orig_timeout
     check(infl_left is not None and '"seq": 7' in (infl_left or ""),
           "E4 回收旧请求不得连带删除新鲜 inflight（seq 7 租约存活）")
 
